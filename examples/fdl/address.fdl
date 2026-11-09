@@ -1,0 +1,7 @@
+// A schema that may be imported by other schemas.
+package examples.fdl;
+
+message Address {
+  string street = 1;
+  string city = 2;
+}

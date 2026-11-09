@@ -1,0 +1,31 @@
+"""Bazel module definition for rules_fory.
+
+rules_fory brings Apache Fory (https://fory.apache.org) serialization to the
+Bazel ecosystem.  It provides:
+
+* `fory_library`      - language independent schema target (like `proto_library`)
+* `cc_fory_library`   - C++ bindings           (like `cc_proto_library`)
+* `py_fory_library`   - Python bindings        (like `py_proto_library`)
+
+Supported Bazel version: 9.2 (bzlmod only, no WORKSPACE).
+"""
+
+module(
+    name = "rules_fory",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_python", version = "1.7.0")
+
+# Only needed to run the rules' own test suite.
+bazel_dep(name = "bazel_skylib", version = "1.8.2", dev_dependency = True)
+
+# Resolve the `foryc` compiler that is installed by the `fory-compiler` wheel.
+# Override the location with `--repo_env=FORYC=/path/to/foryc` or with
+# `foryc.configure(foryc = "/path/to/foryc")` in your MODULE.bazel.
+foryc = use_extension("//fory/toolchains:extensions.bzl", "foryc")
+use_repo(foryc, "foryc")
+
+register_toolchains("//fory/toolchains:local_foryc")

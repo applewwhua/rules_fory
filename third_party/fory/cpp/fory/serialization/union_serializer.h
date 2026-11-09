@@ -1,0 +1,1544 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#pragma once
+
+#include "fory/meta/field.h"
+#include "fory/serialization/ref_mode.h"
+#include "fory/serialization/ref_resolver.h"
+#include "fory/serialization/serializer.h"
+#include "fory/serialization/serializer_traits.h"
+#include "fory/serialization/skip.h"
+#include "fory/serialization/struct_serializer.h"
+#include "fory/type/type.h"
+#include "fory/util/error.h"
+
+#include <array>
+#include <cstddef>
+#include <optional>
+#include <tuple>
+#include <type_traits>
+#include <typeindex>
+#include <utility>
+
+namespace fory {
+namespace serialization {
+
+// Compiler-generated union metadata specializations.
+template <typename T, typename Enable = void> struct UnionCaseIds;
+template <typename T, uint32_t CaseId> struct UnionCaseMeta;
+
+namespace detail {
+
+template <typename T, typename = void>
+struct has_union_case_ids : std::false_type {};
+
+template <typename T>
+struct has_union_case_ids<T, std::void_t<decltype(UnionCaseIds<T>::case_count)>>
+    : std::true_type {};
+
+template <typename T>
+using AdlUnionInfoDescriptor =
+    decltype(fory_union_info(std::declval<::fory::meta::Identity<T>>()));
+
+template <typename T, typename = void>
+struct has_adl_union_info : std::false_type {};
+
+template <typename T>
+struct has_adl_union_info<T, std::void_t<AdlUnionInfoDescriptor<T>>>
+    : std::true_type {};
+
+template <typename T>
+using AdlUnionCaseIdsDescriptor =
+    decltype(fory_union_case_ids(std::declval<::fory::meta::Identity<T>>()));
+
+template <typename T, typename = void>
+struct has_adl_union_case_ids : std::false_type {};
+
+template <typename T>
+struct has_adl_union_case_ids<T, std::void_t<AdlUnionCaseIdsDescriptor<T>>>
+    : std::true_type {};
+
+template <typename T, uint32_t CaseId>
+using AdlUnionCaseMetaDescriptor =
+    decltype(fory_union_case_meta(std::declval<::fory::meta::Identity<T>>(),
+                                  std::integral_constant<uint32_t, CaseId>{}));
+
+template <typename T>
+inline constexpr bool is_union_type_v =
+    has_union_case_ids<T>::value || has_adl_union_info<T>::value ||
+    has_adl_union_case_ids<T>::value;
+
+template <typename T, typename Enable = void> struct UnionInfo;
+
+template <typename T>
+struct UnionInfo<T, std::enable_if_t<has_adl_union_info<T>::value>> {
+  using Descriptor = AdlUnionInfoDescriptor<T>;
+  static constexpr size_t case_count = Descriptor::case_count;
+
+  template <size_t Index> struct CaseId {
+    static constexpr uint32_t value = Descriptor::case_ids[Index];
+  };
+
+  template <size_t Index> struct Meta {
+    static constexpr ::fory::FieldMeta value = Descriptor::case_metas[Index];
+  };
+
+  template <size_t Index>
+  using CaseT = std::tuple_element_t<Index, typename Descriptor::CaseTypes>;
+
+  template <size_t Index> static inline T make(CaseT<Index> value) {
+    auto maker = std::get<Index>(Descriptor::factories);
+    return maker(std::move(value));
+  }
+};
+
+template <typename T>
+struct UnionInfo<T, std::enable_if_t<!has_adl_union_info<T>::value &&
+                                     has_adl_union_case_ids<T>::value>> {
+  using IdsDescriptor = AdlUnionCaseIdsDescriptor<T>;
+  static constexpr size_t case_count = IdsDescriptor::case_count;
+
+  template <size_t Index> struct CaseId {
+    static constexpr uint32_t value = IdsDescriptor::case_ids[Index];
+  };
+
+  template <size_t Index> struct CaseDescriptor {
+    using Descriptor = AdlUnionCaseMetaDescriptor<T, CaseId<Index>::value>;
+    using CaseT = typename Descriptor::CaseT;
+    static constexpr ::fory::FieldMeta meta = Descriptor::meta;
+    static inline T make(CaseT value) {
+      return Descriptor::make(std::move(value));
+    }
+  };
+
+  template <size_t Index> struct Meta {
+    static constexpr ::fory::FieldMeta value = CaseDescriptor<Index>::meta;
+  };
+
+  template <size_t Index> using CaseT = typename CaseDescriptor<Index>::CaseT;
+
+  template <size_t Index> static inline T make(CaseT<Index> value) {
+    return CaseDescriptor<Index>::make(std::move(value));
+  }
+};
+
+template <typename T>
+struct UnionInfo<T, std::enable_if_t<!has_adl_union_info<T>::value &&
+                                     !has_adl_union_case_ids<T>::value>> {
+  static constexpr size_t case_count = UnionCaseIds<T>::case_count;
+
+  template <size_t Index> struct CaseId {
+    static constexpr uint32_t value = UnionCaseIds<T>::case_ids[Index];
+  };
+
+  template <size_t Index> struct Meta {
+    static constexpr ::fory::FieldMeta value =
+        UnionCaseMeta<T, CaseId<Index>::value>::meta;
+  };
+
+  template <size_t Index>
+  using CaseT = typename UnionCaseMeta<T, CaseId<Index>::value>::CaseT;
+
+  template <size_t Index> static inline T make(CaseT<Index> value) {
+    return UnionCaseMeta<T, CaseId<Index>::value>::make(std::move(value));
+  }
+};
+
+template <typename T>
+using decay_t = std::remove_cv_t<std::remove_reference_t<T>>;
+
+template <typename T> struct union_unwrap_optional_inner {
+  using type = decay_t<T>;
+};
+
+template <typename T> struct union_unwrap_optional_inner<std::optional<T>> {
+  using type = decay_t<T>;
+};
+
+template <typename T>
+using union_unwrap_optional_inner_t =
+    typename union_unwrap_optional_inner<T>::type;
+
+template <typename UnionT, size_t Index> struct UnionCaseSpecProvider {
+  static inline constexpr FieldNodeSpec spec =
+      UnionInfo<UnionT>::template Meta<Index>::value.spec_;
+};
+
+template <typename SpecProvider, int8_t NodeIndex = 0>
+constexpr FieldNodeKind union_node_kind() {
+  constexpr auto spec = SpecProvider::spec;
+  return NodeIndex >= 0 ? spec.kind_[NodeIndex] : FieldNodeKind::Default;
+}
+
+template <typename SpecProvider, int8_t NodeIndex = 0>
+constexpr Encoding union_node_encoding() {
+  constexpr auto spec = SpecProvider::spec;
+  return NodeIndex >= 0 ? spec.encoding_[NodeIndex] : Encoding::Default;
+}
+
+template <typename SpecProvider, int8_t NodeIndex = 0>
+constexpr bool union_node_has_override() {
+  constexpr auto spec = SpecProvider::spec;
+  return NodeIndex >= 0 &&
+         (spec.kind_[NodeIndex] != FieldNodeKind::Default ||
+          spec.encoding_[NodeIndex] != Encoding::Default ||
+          spec.scalar_[NodeIndex] != FieldScalarKind::Inferred);
+}
+
+template <typename SpecProvider, int8_t NodeIndex = 0>
+constexpr FieldScalarKind union_node_scalar() {
+  constexpr auto spec = SpecProvider::spec;
+  return NodeIndex >= 0 ? spec.scalar_[NodeIndex] : FieldScalarKind::Inferred;
+}
+
+template <typename SpecProvider, int8_t NodeIndex, int ChildSlot>
+constexpr int8_t union_node_child() {
+  constexpr auto spec = SpecProvider::spec;
+  if constexpr (ChildSlot == 0) {
+    return NodeIndex >= 0 ? spec.child0_[NodeIndex] : -1;
+  } else {
+    return NodeIndex >= 0 ? spec.child1_[NodeIndex] : -1;
+  }
+}
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+constexpr bool union_vector_primitive_array_spec() {
+  if constexpr (!is_vector_v<ValueType>) {
+    return false;
+  } else {
+    using Element = element_type_t<ValueType>;
+    if constexpr (!std::is_same_v<decay_t<Element>, int8_t> &&
+                  !std::is_same_v<decay_t<Element>, uint8_t>) {
+      return false;
+    } else {
+      constexpr FieldNodeKind kind = union_node_kind<SpecProvider, NodeIndex>();
+      constexpr int8_t child = union_node_child<SpecProvider, NodeIndex, 0>();
+      if constexpr (kind != FieldNodeKind::Array || child < 0) {
+        return false;
+      } else if constexpr (union_node_kind<SpecProvider, child>() !=
+                               FieldNodeKind::Scalar ||
+                           union_node_encoding<SpecProvider, child>() !=
+                               Encoding::Default) {
+        return false;
+      } else if constexpr (std::is_same_v<decay_t<Element>, int8_t>) {
+        return union_node_scalar<SpecProvider, child>() ==
+               FieldScalarKind::Int8;
+      } else {
+        return union_node_scalar<SpecProvider, child>() ==
+               FieldScalarKind::UInt8;
+      }
+    }
+  }
+}
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+constexpr uint32_t union_vector_array_type_id() {
+  if constexpr (!is_vector_v<ValueType>) {
+    return 0;
+  } else {
+    constexpr FieldNodeKind kind = union_node_kind<SpecProvider, NodeIndex>();
+    constexpr int8_t child = union_node_child<SpecProvider, NodeIndex, 0>();
+    if constexpr (kind != FieldNodeKind::Array || child < 0) {
+      return 0;
+    } else if constexpr (union_node_kind<SpecProvider, child>() !=
+                         FieldNodeKind::Scalar) {
+      return 0;
+    } else {
+      using Element = element_type_t<ValueType>;
+      constexpr FieldScalarKind scalar =
+          union_node_scalar<SpecProvider, child>();
+      if constexpr (!configured_scalar_kind_matches<Element, scalar>()) {
+        return 0;
+      } else {
+        return static_cast<uint32_t>(primitive_array_type_id<Element>());
+      }
+    }
+  }
+}
+
+template <typename T>
+constexpr uint32_t resolve_union_type_id(const ::fory::FieldMeta &meta) {
+  if (meta.type_id_override_ >= 0) {
+    return static_cast<uint32_t>(meta.type_id_override_);
+  }
+
+  using Inner = union_unwrap_optional_inner_t<T>;
+  if constexpr (std::is_same_v<Inner, uint32_t>) {
+    if (meta.encoding_ == ::fory::Encoding::Varint ||
+        meta.encoding_ == ::fory::Encoding::Default) {
+      return static_cast<uint32_t>(TypeId::VAR_UINT32);
+    }
+    return static_cast<uint32_t>(TypeId::UINT32);
+  }
+  if constexpr (std::is_same_v<Inner, uint64_t>) {
+    if (meta.encoding_ == ::fory::Encoding::Varint) {
+      return static_cast<uint32_t>(TypeId::VAR_UINT64);
+    }
+    if (meta.encoding_ == ::fory::Encoding::Tagged) {
+      return static_cast<uint32_t>(TypeId::TAGGED_UINT64);
+    }
+    return static_cast<uint32_t>(TypeId::UINT64);
+  }
+  if constexpr (std::is_same_v<Inner, int32_t> || std::is_same_v<Inner, int>) {
+    if (meta.encoding_ == ::fory::Encoding::Fixed) {
+      return static_cast<uint32_t>(TypeId::INT32);
+    }
+    return static_cast<uint32_t>(TypeId::VARINT32);
+  }
+  if constexpr (std::is_same_v<Inner, int64_t> ||
+                std::is_same_v<Inner, long long>) {
+    if (meta.encoding_ == ::fory::Encoding::Fixed) {
+      return static_cast<uint32_t>(TypeId::INT64);
+    }
+    if (meta.encoding_ == ::fory::Encoding::Tagged) {
+      return static_cast<uint32_t>(TypeId::TAGGED_INT64);
+    }
+    return static_cast<uint32_t>(TypeId::VARINT64);
+  }
+
+  return static_cast<uint32_t>(Serializer<Inner>::type_id);
+}
+
+template <typename T, typename SpecProvider>
+constexpr uint32_t
+resolve_union_type_id_for_spec(const ::fory::FieldMeta &meta) {
+  using Inner = union_unwrap_optional_inner_t<T>;
+  constexpr uint32_t array_tid =
+      union_vector_array_type_id<Inner, SpecProvider, 0>();
+  if constexpr (array_tid != 0) {
+    return array_tid;
+  } else if constexpr (union_node_kind<SpecProvider, 0>() ==
+                       FieldNodeKind::Array) {
+    return static_cast<uint32_t>(TypeId::ARRAY);
+  } else if constexpr (union_node_kind<SpecProvider, 0>() ==
+                       FieldNodeKind::List) {
+    return static_cast<uint32_t>(TypeId::LIST);
+  } else if constexpr (union_node_kind<SpecProvider, 0>() ==
+                       FieldNodeKind::Set) {
+    return static_cast<uint32_t>(TypeId::SET);
+  } else if constexpr (union_node_kind<SpecProvider, 0>() ==
+                       FieldNodeKind::Map) {
+    return static_cast<uint32_t>(TypeId::MAP);
+  }
+  return resolve_union_type_id<T>(meta);
+}
+
+template <typename T>
+constexpr bool needs_manual_encoding(const ::fory::FieldMeta &meta) {
+  if (meta.type_id_override_ >= 0 ||
+      meta.encoding_ != ::fory::Encoding::Default) {
+    return true;
+  }
+  using Inner = union_unwrap_optional_inner_t<T>;
+  return static_cast<uint32_t>(Serializer<Inner>::type_id) !=
+         resolve_union_type_id<T>(meta);
+}
+
+template <typename FieldType, typename SpecProvider, int8_t NodeIndex>
+FORY_ALWAYS_INLINE void write_union_configured_scalar(const FieldType &value,
+                                                      WriteContext &ctx) {
+  constexpr Encoding enc = union_node_encoding<SpecProvider, NodeIndex>();
+  if constexpr (is_configurable_int_v<FieldType>) {
+    if constexpr (std::is_same_v<FieldType, uint32_t>) {
+      if constexpr (enc == Encoding::Varint) {
+        ctx.write_var_uint32(value);
+      } else {
+        ctx.buffer().write_int32(static_cast<int32_t>(value));
+      }
+    } else if constexpr (std::is_same_v<FieldType, uint64_t>) {
+      if constexpr (enc == Encoding::Varint) {
+        ctx.write_var_uint64(value);
+      } else if constexpr (enc == Encoding::Tagged) {
+        ctx.write_tagged_uint64(value);
+      } else {
+        ctx.buffer().write_int64(static_cast<int64_t>(value));
+      }
+    } else if constexpr (std::is_same_v<FieldType, int32_t> ||
+                         std::is_same_v<FieldType, int>) {
+      if constexpr (enc == Encoding::Fixed) {
+        ctx.buffer().write_int32(static_cast<int32_t>(value));
+      } else {
+        ctx.write_var_int32(static_cast<int32_t>(value));
+      }
+    } else if constexpr (std::is_same_v<FieldType, int64_t> ||
+                         std::is_same_v<FieldType, long long>) {
+      if constexpr (enc == Encoding::Fixed) {
+        ctx.buffer().write_int64(static_cast<int64_t>(value));
+      } else if constexpr (enc == Encoding::Tagged) {
+        ctx.write_tagged_int64(static_cast<int64_t>(value));
+      } else {
+        ctx.write_var_int64(static_cast<int64_t>(value));
+      }
+    } else {
+      Serializer<FieldType>::write_data(value, ctx);
+    }
+  } else {
+    Serializer<FieldType>::write_data(value, ctx);
+  }
+}
+
+template <typename FieldType, typename SpecProvider, int8_t NodeIndex>
+FORY_ALWAYS_INLINE FieldType read_union_configured_scalar(ReadContext &ctx) {
+  if constexpr (is_configurable_int_v<FieldType>) {
+    constexpr Encoding enc = union_node_encoding<SpecProvider, NodeIndex>();
+    if constexpr (std::is_same_v<FieldType, uint32_t>) {
+      if constexpr (enc == Encoding::Varint) {
+        return static_cast<FieldType>(ctx.read_var_uint32(ctx.error()));
+      }
+      return static_cast<FieldType>(ctx.read_int32(ctx.error()));
+    } else if constexpr (std::is_same_v<FieldType, uint64_t>) {
+      if constexpr (enc == Encoding::Varint) {
+        return static_cast<FieldType>(ctx.read_var_uint64(ctx.error()));
+      } else if constexpr (enc == Encoding::Tagged) {
+        return static_cast<FieldType>(ctx.read_tagged_uint64(ctx.error()));
+      }
+      return static_cast<FieldType>(ctx.read_uint64(ctx.error()));
+    } else if constexpr (std::is_same_v<FieldType, int32_t> ||
+                         std::is_same_v<FieldType, int>) {
+      if constexpr (enc == Encoding::Fixed) {
+        return static_cast<FieldType>(ctx.read_int32(ctx.error()));
+      }
+      return static_cast<FieldType>(ctx.read_var_int32(ctx.error()));
+    } else if constexpr (std::is_same_v<FieldType, int64_t> ||
+                         std::is_same_v<FieldType, long long>) {
+      if constexpr (enc == Encoding::Fixed) {
+        return static_cast<FieldType>(ctx.read_int64(ctx.error()));
+      } else if constexpr (enc == Encoding::Tagged) {
+        return static_cast<FieldType>(ctx.read_tagged_int64(ctx.error()));
+      }
+      return static_cast<FieldType>(ctx.read_var_int64(ctx.error()));
+    } else {
+      return Serializer<FieldType>::read_data(ctx);
+    }
+  } else {
+    return Serializer<FieldType>::read_data(ctx);
+  }
+}
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+void write_union_configured_value(const ValueType &value, WriteContext &ctx,
+                                  RefMode ref_mode, bool write_type,
+                                  bool has_generics);
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+ValueType read_union_configured_value(ReadContext &ctx, RefMode ref_mode,
+                                      bool read_type);
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+inline constexpr bool union_read_data_always_advances() {
+  if constexpr (is_optional_v<ValueType>) {
+    using Inner = typename ValueType::value_type;
+    constexpr FieldNodeKind kind = union_node_kind<SpecProvider, NodeIndex>();
+    constexpr int8_t child =
+        kind == FieldNodeKind::Inner
+            ? union_node_child<SpecProvider, NodeIndex, 0>()
+            : NodeIndex;
+    return union_read_data_always_advances<Inner, SpecProvider, child>();
+  }
+  return read_data_always_advances_v<ValueType>;
+}
+
+template <bool MeasureProgress, typename Container, typename SpecProvider,
+          int8_t ElemNode>
+inline bool read_union_list_items(Container &result, ReadContext &ctx,
+                                  uint32_t length) {
+  using Elem = element_type_t<Container>;
+  uint32_t checkpoint_item = 0;
+  uint64_t checkpoint_byte = 0;
+  if constexpr (MeasureProgress) {
+    checkpoint_byte = ctx.buffer().logical_reader_index();
+  }
+  for (uint32_t i = 0; i < length; ++i) {
+    if constexpr (ElemNode >= 0) {
+      auto elem = read_union_configured_value<Elem, SpecProvider, ElemNode>(
+          ctx, RefMode::None, false);
+      collection_insert(result, std::move(elem));
+    } else {
+      auto elem = Serializer<Elem>::read_data(ctx);
+      collection_insert(result, std::move(elem));
+    }
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return false;
+    }
+    if constexpr (MeasureProgress) {
+      const uint32_t completed = i + 1;
+      if ((completed & 1023U) == 0) {
+        if (FORY_PREDICT_FALSE(!detail::settle_unbacked_container_items(
+                ctx, completed - checkpoint_item, checkpoint_byte))) {
+          return false;
+        }
+        checkpoint_item = completed;
+        checkpoint_byte = ctx.buffer().logical_reader_index();
+      }
+    }
+  }
+  if constexpr (MeasureProgress) {
+    return checkpoint_item == length ||
+           detail::settle_unbacked_container_items(
+               ctx, length - checkpoint_item, checkpoint_byte);
+  }
+  return true;
+}
+
+template <typename Container, typename SpecProvider, int8_t ElemNode>
+void write_union_configured_list_data(const Container &coll,
+                                      WriteContext &ctx) {
+  using Elem = element_type_t<Container>;
+  ctx.write_var_uint32(static_cast<uint32_t>(coll.size()));
+  if (coll.empty()) {
+    return;
+  }
+  ctx.write_uint8(COLL_DECL_ELEMENT_TYPE | COLL_IS_SAME_TYPE);
+  for (const auto &elem : coll) {
+    if constexpr (ElemNode >= 0) {
+      write_union_configured_value<Elem, SpecProvider, ElemNode>(
+          elem, ctx, RefMode::None, false, true);
+    } else {
+      Serializer<Elem>::write_data(elem, ctx);
+    }
+  }
+}
+
+template <typename Container, typename SpecProvider, int8_t ElemNode>
+Container read_union_configured_list_data(ReadContext &ctx) {
+  using Elem = element_type_t<Container>;
+  uint32_t length = ctx.read_var_uint32(ctx.error());
+  Container result;
+  if (length == 0) {
+    return result;
+  }
+  uint8_t bitmap = ctx.read_uint8(ctx.error());
+  if (FORY_PREDICT_FALSE(ctx.has_error())) {
+    return result;
+  }
+  const bool is_decl_type = (bitmap & COLL_DECL_ELEMENT_TYPE) != 0;
+  const bool is_same_type = (bitmap & COLL_IS_SAME_TYPE) != 0;
+  if (is_same_type && !is_decl_type) {
+    (void)ctx.read_any_type_info(ctx.error());
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return result;
+    }
+  }
+  constexpr bool element_read_data_always_advances = []() constexpr {
+    if constexpr (ElemNode >= 0) {
+      return union_read_data_always_advances<Elem, SpecProvider, ElemNode>();
+    }
+    return read_data_always_advances_v<Elem>;
+  }();
+  if (FORY_PREDICT_FALSE(!reserve_collection<element_read_data_always_advances>(
+          result, ctx, length))) {
+    return result;
+  }
+  if constexpr (element_read_data_always_advances) {
+    (void)read_union_list_items<false, Container, SpecProvider, ElemNode>(
+        result, ctx, length);
+  } else {
+    (void)read_union_list_items<true, Container, SpecProvider, ElemNode>(
+        result, ctx, length);
+  }
+  return result;
+}
+
+template <typename MapType, typename SpecProvider, int8_t KeyNode,
+          int8_t ValueNode>
+void write_union_configured_map_data(const MapType &map, WriteContext &ctx) {
+  using Key = key_type_t<MapType>;
+  using Value = mapped_type_t<MapType>;
+  ctx.write_var_uint32(static_cast<uint32_t>(map.size()));
+  if (map.empty()) {
+    return;
+  }
+  size_t header_offset = 0;
+  uint8_t pair_counter = 0;
+  bool need_write_header = true;
+  for (const auto &[key, value] : map) {
+    if (need_write_header) {
+      ctx.enter_flush_barrier();
+      header_offset = ctx.buffer().writer_index();
+      ctx.write_uint16(0);
+      ctx.buffer().unsafe_put_byte(
+          header_offset, static_cast<uint8_t>(DECL_KEY_TYPE | DECL_VALUE_TYPE));
+      need_write_header = false;
+    }
+    if constexpr (KeyNode >= 0) {
+      write_union_configured_value<Key, SpecProvider, KeyNode>(
+          key, ctx, RefMode::None, false, true);
+    } else {
+      Serializer<Key>::write_data(key, ctx);
+    }
+    if constexpr (ValueNode >= 0) {
+      write_union_configured_value<Value, SpecProvider, ValueNode>(
+          value, ctx, RefMode::None, false, true);
+    } else {
+      Serializer<Value>::write_data(value, ctx);
+    }
+    ++pair_counter;
+    if (pair_counter == MAX_CHUNK_SIZE) {
+      write_chunk_size(ctx, header_offset, pair_counter);
+      ctx.exit_flush_barrier();
+      ctx.try_flush();
+      pair_counter = 0;
+      need_write_header = true;
+    }
+  }
+  if (pair_counter > 0) {
+    write_chunk_size(ctx, header_offset, pair_counter);
+    ctx.exit_flush_barrier();
+    ctx.try_flush();
+  }
+}
+
+template <bool MeasureProgress, typename MapType, typename SpecProvider,
+          int8_t KeyNode, int8_t ValueNode>
+inline bool read_union_map_chunk(MapType &result, ReadContext &ctx,
+                                 uint8_t chunk_size) {
+  using Key = key_type_t<MapType>;
+  using Value = mapped_type_t<MapType>;
+  uint64_t checkpoint_byte = 0;
+  if constexpr (MeasureProgress) {
+    checkpoint_byte = ctx.buffer().logical_reader_index();
+  }
+  for (uint8_t i = 0; i < chunk_size; ++i) {
+    Key key = [&]() {
+      if constexpr (KeyNode >= 0) {
+        return read_union_configured_value<Key, SpecProvider, KeyNode>(
+            ctx, RefMode::None, false);
+      }
+      return Serializer<Key>::read_data(ctx);
+    }();
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return false;
+    }
+    Value value = [&]() {
+      if constexpr (ValueNode >= 0) {
+        return read_union_configured_value<Value, SpecProvider, ValueNode>(
+            ctx, RefMode::None, false);
+      }
+      return Serializer<Value>::read_data(ctx);
+    }();
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return false;
+    }
+    result.emplace(std::move(key), std::move(value));
+  }
+  if constexpr (MeasureProgress) {
+    return detail::settle_unbacked_container_items(ctx, chunk_size,
+                                                   checkpoint_byte);
+  }
+  return true;
+}
+
+template <typename MapType, typename SpecProvider, int8_t KeyNode,
+          int8_t ValueNode>
+MapType read_union_configured_map_data(ReadContext &ctx) {
+  using Key = key_type_t<MapType>;
+  using Value = mapped_type_t<MapType>;
+  uint32_t length = ctx.read_var_uint32(ctx.error());
+  MapType result;
+  if (length == 0) {
+    return result;
+  }
+  constexpr bool key_read_data_always_advances = []() constexpr {
+    if constexpr (KeyNode >= 0) {
+      return union_read_data_always_advances<Key, SpecProvider, KeyNode>();
+    }
+    return read_data_always_advances_v<Key>;
+  }();
+  constexpr bool value_read_data_always_advances = []() constexpr {
+    if constexpr (ValueNode >= 0) {
+      return union_read_data_always_advances<Value, SpecProvider, ValueNode>();
+    }
+    return read_data_always_advances_v<Value>;
+  }();
+  constexpr bool entry_read_data_always_advances =
+      key_read_data_always_advances || value_read_data_always_advances;
+  if (FORY_PREDICT_FALSE(
+          !reserve_map<entry_read_data_always_advances>(result, ctx, length))) {
+    return result;
+  }
+  uint32_t read_count = 0;
+  while (read_count < length && !ctx.has_error()) {
+    uint8_t header = ctx.read_uint8(ctx.error());
+    uint8_t chunk_size = ctx.read_uint8(ctx.error());
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return result;
+    }
+    if (FORY_PREDICT_FALSE(!detail::check_map_chunk_size(
+            ctx, chunk_size, length - read_count))) {
+      return result;
+    }
+    const bool key_decl = (header & DECL_KEY_TYPE) != 0;
+    const bool value_decl = (header & DECL_VALUE_TYPE) != 0;
+    if (!key_decl) {
+      (void)ctx.read_any_type_info(ctx.error());
+    }
+    if (!value_decl) {
+      (void)ctx.read_any_type_info(ctx.error());
+    }
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return result;
+    }
+    if constexpr (entry_read_data_always_advances) {
+      if (FORY_PREDICT_FALSE(
+              (!read_union_map_chunk<false, MapType, SpecProvider, KeyNode,
+                                     ValueNode>(result, ctx, chunk_size)))) {
+        return result;
+      }
+    } else if (FORY_PREDICT_FALSE(
+                   (!read_union_map_chunk<true, MapType, SpecProvider, KeyNode,
+                                          ValueNode>(result, ctx,
+                                                     chunk_size)))) {
+      return result;
+    }
+    read_count += chunk_size;
+  }
+  return result;
+}
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+void write_union_configured_value(const ValueType &value, WriteContext &ctx,
+                                  RefMode ref_mode, bool write_type,
+                                  bool has_generics) {
+  constexpr FieldNodeKind kind = union_node_kind<SpecProvider, NodeIndex>();
+  constexpr FieldScalarKind scalar_kind =
+      union_node_scalar<SpecProvider, NodeIndex>();
+  static_assert(configured_scalar_kind_matches<ValueType, scalar_kind>(),
+                "fory::T typed scalar spec does not match the C++ union case "
+                "type");
+  if constexpr (is_optional_v<ValueType>) {
+    using Inner = typename ValueType::value_type;
+    if (!value.has_value()) {
+      if (ref_mode != RefMode::None) {
+        ctx.write_int8(NULL_FLAG);
+      }
+      return;
+    }
+    write_not_null_ref_flag(ctx, ref_mode);
+    constexpr int8_t child =
+        kind == FieldNodeKind::Inner
+            ? union_node_child<SpecProvider, NodeIndex, 0>()
+            : NodeIndex;
+    write_union_configured_value<Inner, SpecProvider, child>(
+        *value, ctx, RefMode::None, false, has_generics);
+  } else if constexpr ((is_vector_v<ValueType> || is_list_v<ValueType> ||
+                        is_deque_v<ValueType> || is_set_like_v<ValueType>) &&
+                       kind == FieldNodeKind::Array) {
+    Serializer<ValueType>::write(value, ctx, ref_mode, false, has_generics);
+  } else if constexpr ((is_vector_v<ValueType> || is_list_v<ValueType> ||
+                        is_deque_v<ValueType> || is_set_like_v<ValueType>) &&
+                       (kind == FieldNodeKind::List ||
+                        kind == FieldNodeKind::Set)) {
+    if constexpr (union_vector_primitive_array_spec<ValueType, SpecProvider,
+                                                    NodeIndex>()) {
+      Serializer<ValueType>::write(value, ctx, ref_mode, false, has_generics);
+    } else {
+      write_not_null_ref_flag(ctx, ref_mode);
+      constexpr int8_t child = union_node_child<SpecProvider, NodeIndex, 0>();
+      write_union_configured_list_data<ValueType, SpecProvider, child>(value,
+                                                                       ctx);
+    }
+  } else if constexpr (is_map_like_v<ValueType> && kind == FieldNodeKind::Map) {
+    write_not_null_ref_flag(ctx, ref_mode);
+    constexpr int8_t key_child = union_node_child<SpecProvider, NodeIndex, 0>();
+    constexpr int8_t value_child =
+        union_node_child<SpecProvider, NodeIndex, 1>();
+    write_union_configured_map_data<ValueType, SpecProvider, key_child,
+                                    value_child>(value, ctx);
+  } else if constexpr (kind == FieldNodeKind::Scalar ||
+                       union_node_encoding<SpecProvider, NodeIndex>() !=
+                           Encoding::Default) {
+    write_not_null_ref_flag(ctx, ref_mode);
+    write_union_configured_scalar<ValueType, SpecProvider, NodeIndex>(value,
+                                                                      ctx);
+  } else {
+    Serializer<ValueType>::write(value, ctx, ref_mode, write_type,
+                                 has_generics);
+  }
+}
+
+template <typename ValueType, typename SpecProvider, int8_t NodeIndex>
+ValueType read_union_configured_value(ReadContext &ctx, RefMode ref_mode,
+                                      bool read_type) {
+  constexpr FieldNodeKind kind = union_node_kind<SpecProvider, NodeIndex>();
+  constexpr FieldScalarKind scalar_kind =
+      union_node_scalar<SpecProvider, NodeIndex>();
+  static_assert(configured_scalar_kind_matches<ValueType, scalar_kind>(),
+                "fory::T typed scalar spec does not match the C++ union case "
+                "type");
+  if constexpr (is_optional_v<ValueType>) {
+    using Inner = typename ValueType::value_type;
+    if (!read_null_only_flag(ctx, ref_mode)) {
+      return std::nullopt;
+    }
+    constexpr int8_t child =
+        kind == FieldNodeKind::Inner
+            ? union_node_child<SpecProvider, NodeIndex, 0>()
+            : NodeIndex;
+    Inner inner = read_union_configured_value<Inner, SpecProvider, child>(
+        ctx, RefMode::None, false);
+    return ValueType{std::move(inner)};
+  } else if constexpr ((is_vector_v<ValueType> || is_list_v<ValueType> ||
+                        is_deque_v<ValueType> || is_set_like_v<ValueType>) &&
+                       kind == FieldNodeKind::Array) {
+    return Serializer<ValueType>::read(ctx, ref_mode, false);
+  } else if constexpr ((is_vector_v<ValueType> || is_list_v<ValueType> ||
+                        is_deque_v<ValueType> || is_set_like_v<ValueType>) &&
+                       (kind == FieldNodeKind::List ||
+                        kind == FieldNodeKind::Set)) {
+    if constexpr (union_vector_primitive_array_spec<ValueType, SpecProvider,
+                                                    NodeIndex>()) {
+      return Serializer<ValueType>::read(ctx, ref_mode, false);
+    } else {
+      if (!read_null_only_flag(ctx, ref_mode)) {
+        return ValueType{};
+      }
+      constexpr int8_t child = union_node_child<SpecProvider, NodeIndex, 0>();
+      return read_union_configured_list_data<ValueType, SpecProvider, child>(
+          ctx);
+    }
+  } else if constexpr (is_map_like_v<ValueType> && kind == FieldNodeKind::Map) {
+    if (!read_null_only_flag(ctx, ref_mode)) {
+      return ValueType{};
+    }
+    constexpr int8_t key_child = union_node_child<SpecProvider, NodeIndex, 0>();
+    constexpr int8_t value_child =
+        union_node_child<SpecProvider, NodeIndex, 1>();
+    return read_union_configured_map_data<ValueType, SpecProvider, key_child,
+                                          value_child>(ctx);
+  } else if constexpr (kind == FieldNodeKind::Scalar ||
+                       union_node_encoding<SpecProvider, NodeIndex>() !=
+                           Encoding::Default) {
+    if (!read_null_only_flag(ctx, ref_mode)) {
+      return ValueType{};
+    }
+    return read_union_configured_scalar<ValueType, SpecProvider, NodeIndex>(
+        ctx);
+  } else {
+    return Serializer<ValueType>::read(ctx, ref_mode, read_type);
+  }
+}
+
+template <typename T>
+inline bool write_union_ref_flag(const T &value, WriteContext &ctx,
+                                 RefMode ref_mode, bool nullable) {
+  if (ref_mode == RefMode::None) {
+    return true;
+  }
+  if constexpr (is_nullable_v<decay_t<T>>) {
+    if (nullable && is_null_value(value)) {
+      ctx.write_int8(NULL_FLAG);
+      return false;
+    }
+  }
+  if (ref_mode == RefMode::Tracking && ctx.track_ref()) {
+    ctx.write_int8(REF_VALUE_FLAG);
+    ctx.ref_writer().reserve_ref_id();
+    return true;
+  }
+  ctx.write_int8(NOT_NULL_VALUE_FLAG);
+  return true;
+}
+
+inline bool read_union_ref_flag(ReadContext &ctx, RefMode ref_mode,
+                                bool nullable, bool &is_null) {
+  is_null = false;
+  if (ref_mode == RefMode::None) {
+    return true;
+  }
+  int8_t ref_flag = ctx.read_int8(ctx.error());
+  if (FORY_PREDICT_FALSE(ctx.has_error())) {
+    return false;
+  }
+  if (ref_flag == NULL_FLAG) {
+    if (!nullable) {
+      ctx.set_error(Error::invalid_data("Null value encountered for union"));
+      return false;
+    }
+    is_null = true;
+    return false;
+  }
+  if (ref_flag == REF_FLAG) {
+    (void)ctx.read_var_uint32(ctx.error());
+    ctx.set_error(Error::invalid_ref("Unexpected reference flag for union"));
+    return false;
+  }
+  if (ref_flag != NOT_NULL_VALUE_FLAG && ref_flag != REF_VALUE_FLAG) {
+    ctx.set_error(Error::invalid_ref("Unknown ref flag for union value"));
+    return false;
+  }
+  if (ctx.track_ref() && ref_flag == REF_VALUE_FLAG) {
+    ctx.ref_reader().reserve_ref_id();
+  }
+  return true;
+}
+
+template <typename T>
+inline const union_unwrap_optional_inner_t<T> &
+unwrap_union_value(const T &value) {
+  if constexpr (is_optional_v<decay_t<T>>) {
+    return value.value();
+  } else {
+    return value;
+  }
+}
+
+template <typename T>
+inline T wrap_union_case_value(union_unwrap_optional_inner_t<T> &&value) {
+  if constexpr (is_optional_v<decay_t<T>>) {
+    return T{std::move(value)};
+  } else {
+    return T{std::move(value)};
+  }
+}
+
+template <typename T> inline T default_union_case_value() { return T{}; }
+
+template <typename T>
+inline void write_union_value_data(const T &value, WriteContext &ctx,
+                                   uint32_t type_id) {
+  using Inner = union_unwrap_optional_inner_t<T>;
+  const Inner &inner = unwrap_union_value(value);
+  if constexpr (std::is_integral_v<Inner> || std::is_enum_v<Inner>) {
+    switch (static_cast<TypeId>(type_id)) {
+    case TypeId::VAR_UINT32:
+      ctx.write_var_uint32(static_cast<uint32_t>(inner));
+      return;
+    case TypeId::UINT32:
+      ctx.buffer().write_int32(static_cast<int32_t>(inner));
+      return;
+    case TypeId::VAR_UINT64:
+      ctx.write_var_uint64(static_cast<uint64_t>(inner));
+      return;
+    case TypeId::UINT64:
+      ctx.buffer().write_int64(static_cast<int64_t>(inner));
+      return;
+    case TypeId::TAGGED_UINT64:
+      ctx.write_tagged_uint64(static_cast<uint64_t>(inner));
+      return;
+    case TypeId::VARINT32:
+      ctx.write_var_int32(static_cast<int32_t>(inner));
+      return;
+    case TypeId::INT32:
+      ctx.buffer().write_int32(static_cast<int32_t>(inner));
+      return;
+    case TypeId::VARINT64:
+      ctx.write_var_int64(static_cast<int64_t>(inner));
+      return;
+    case TypeId::INT64:
+      ctx.buffer().write_int64(static_cast<int64_t>(inner));
+      return;
+    case TypeId::TAGGED_INT64:
+      ctx.write_tagged_int64(static_cast<int64_t>(inner));
+      return;
+    default:
+      break;
+    }
+  }
+  Serializer<Inner>::write_data(inner, ctx);
+}
+
+template <typename T>
+inline T read_union_value_data(ReadContext &ctx, uint32_t type_id) {
+  using Inner = union_unwrap_optional_inner_t<T>;
+  Inner value{};
+  if constexpr (std::is_integral_v<Inner> || std::is_enum_v<Inner>) {
+    switch (static_cast<TypeId>(type_id)) {
+    case TypeId::VAR_UINT32:
+      value = static_cast<Inner>(ctx.read_var_uint32(ctx.error()));
+      break;
+    case TypeId::UINT32:
+      value = static_cast<Inner>(ctx.read_uint32(ctx.error()));
+      break;
+    case TypeId::VAR_UINT64:
+      value = static_cast<Inner>(ctx.read_var_uint64(ctx.error()));
+      break;
+    case TypeId::UINT64:
+      value = static_cast<Inner>(ctx.read_uint64(ctx.error()));
+      break;
+    case TypeId::TAGGED_UINT64:
+      value = static_cast<Inner>(ctx.read_tagged_uint64(ctx.error()));
+      break;
+    case TypeId::VARINT32:
+      value = static_cast<Inner>(ctx.read_var_int32(ctx.error()));
+      break;
+    case TypeId::INT32:
+      value = static_cast<Inner>(ctx.read_int32(ctx.error()));
+      break;
+    case TypeId::VARINT64:
+      value = static_cast<Inner>(ctx.read_var_int64(ctx.error()));
+      break;
+    case TypeId::INT64:
+      value = static_cast<Inner>(ctx.read_int64(ctx.error()));
+      break;
+    case TypeId::TAGGED_INT64:
+      value = static_cast<Inner>(ctx.read_tagged_int64(ctx.error()));
+      break;
+    default:
+      value = Serializer<Inner>::read_data(ctx);
+      break;
+    }
+  } else {
+    value = Serializer<Inner>::read_data(ctx);
+  }
+  if (FORY_PREDICT_FALSE(ctx.has_error())) {
+    return default_union_case_value<T>();
+  }
+  return wrap_union_case_value<T>(std::move(value));
+}
+
+template <typename T, typename F, size_t Index = 0>
+inline bool dispatch_union_case(uint32_t case_id, F &&fn) {
+  if constexpr (Index < UnionInfo<T>::case_count) {
+    constexpr uint32_t id = UnionInfo<T>::template CaseId<Index>::value;
+    if (case_id == id) {
+      fn(std::integral_constant<size_t, Index>{});
+      return true;
+    }
+    return dispatch_union_case<T, F, Index + 1>(case_id, std::forward<F>(fn));
+  }
+  return false;
+}
+
+template <typename Factory> struct UnionFactoryArg;
+
+template <typename R, typename Arg> struct UnionFactoryArg<R (*)(Arg)> {
+  using type = Arg;
+};
+
+} // namespace detail
+
+// ============================================================================//
+// Union serializer
+// ============================================================================//
+
+template <typename T>
+struct Serializer<T, std::enable_if_t<detail::is_union_type_v<T>>> {
+  static constexpr TypeId type_id = TypeId::UNION;
+  static constexpr bool read_data_always_advances = true;
+
+  static inline void write_type_info(WriteContext &ctx) {
+    auto type_info_res = ctx.type_resolver().template get_type_info<T>();
+    if (FORY_PREDICT_FALSE(!type_info_res.ok())) {
+      ctx.set_error(std::move(type_info_res).error());
+      return;
+    }
+    auto result = ctx.write_any_type_info(type_info_res.value());
+    if (FORY_PREDICT_FALSE(!result.ok())) {
+      ctx.set_error(std::move(result).error());
+    }
+  }
+
+  static inline void read_type_info(ReadContext &ctx) {
+    auto type_info_res = ctx.type_resolver().template get_type_info<T>();
+    if (FORY_PREDICT_FALSE(!type_info_res.ok())) {
+      ctx.set_error(std::move(type_info_res).error());
+      return;
+    }
+    const TypeInfo *expected = type_info_res.value();
+    const TypeInfo *remote =
+        ctx.read_any_type_info_owner(ctx.error(), expected);
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return;
+    }
+    if (!remote || remote->type_id != expected->type_id) {
+      ctx.set_error(Error::type_mismatch(remote ? remote->type_id : 0u,
+                                         expected->type_id));
+    }
+  }
+
+  static inline void write(const T &obj, WriteContext &ctx, RefMode ref_mode,
+                           bool write_type, bool has_generics = false) {
+    (void)has_generics;
+    if (ref_mode == RefMode::Tracking && ctx.track_ref()) {
+      ctx.write_int8(REF_VALUE_FLAG);
+      ctx.ref_writer().reserve_ref_id();
+    } else if (ref_mode != RefMode::None) {
+      ctx.write_int8(NOT_NULL_VALUE_FLAG);
+    }
+    if (write_type) {
+      write_type_info(ctx);
+      if (FORY_PREDICT_FALSE(ctx.has_error())) {
+        return;
+      }
+    }
+    write_data(obj, ctx);
+  }
+
+  static inline void write_data(const T &obj, WriteContext &ctx) {
+    uint32_t case_id = obj.fory_case_id();
+    ctx.write_var_uint32(case_id);
+
+    bool matched = detail::dispatch_union_case<T>(case_id, [&](auto tag) {
+      constexpr size_t index = decltype(tag)::value;
+      using CaseT = typename detail::UnionInfo<T>::template CaseT<index>;
+      constexpr ::fory::FieldMeta meta =
+          detail::UnionInfo<T>::template Meta<index>::value;
+      using SpecProvider = detail::UnionCaseSpecProvider<T, index>;
+      constexpr uint32_t field_type_id =
+          detail::resolve_union_type_id_for_spec<CaseT, SpecProvider>(meta);
+      constexpr bool configured =
+          detail::union_node_has_override<SpecProvider, 0>();
+      const bool manual =
+          configured || detail::needs_manual_encoding<CaseT>(meta);
+      constexpr bool nullable =
+          meta.nullable_ || is_nullable_v<detail::decay_t<CaseT>>;
+      const RefMode value_ref_mode =
+          meta.ref_ ? RefMode::Tracking : RefMode::NullOnly;
+
+      obj.visit([&](const auto &value) {
+        using ValueType = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<ValueType, CaseT>) {
+          if (manual) {
+            if (!detail::write_union_ref_flag(value, ctx, value_ref_mode,
+                                              nullable)) {
+              return;
+            }
+            ctx.write_uint8(static_cast<uint8_t>(field_type_id));
+            if constexpr (detail::union_node_has_override<SpecProvider, 0>()) {
+              detail::write_union_configured_value<CaseT, SpecProvider, 0>(
+                  value, ctx, RefMode::None, false, true);
+            } else {
+              detail::write_union_value_data(value, ctx, field_type_id);
+            }
+            return;
+          }
+          Serializer<CaseT>::write(value, ctx, value_ref_mode, true);
+        } else {
+          ctx.set_error(Error::invalid_data("Union case type mismatch"));
+        }
+      });
+    });
+
+    if (FORY_PREDICT_FALSE(!matched)) {
+      ctx.set_error(Error::invalid_data("Unknown union case id"));
+    }
+  }
+
+  static inline void write_data_generic(const T &obj, WriteContext &ctx,
+                                        bool has_generics) {
+    (void)has_generics;
+    write_data(obj, ctx);
+  }
+
+  static inline T read(ReadContext &ctx, RefMode ref_mode, bool read_type) {
+    int8_t ref_flag = NOT_NULL_VALUE_FLAG;
+    if (ref_mode != RefMode::None) {
+      ref_flag = ctx.read_int8(ctx.error());
+      if (FORY_PREDICT_FALSE(ctx.has_error())) {
+        return default_value();
+      }
+    }
+    if (ref_flag == NULL_FLAG) {
+      ctx.set_error(Error::invalid_data("Null value encountered for union"));
+      return default_value();
+    }
+    if (ref_flag == REF_FLAG) {
+      ctx.set_error(Error::invalid_ref("Unexpected reference flag for union"));
+      return default_value();
+    }
+    if (ref_flag != NOT_NULL_VALUE_FLAG && ref_flag != REF_VALUE_FLAG) {
+      ctx.set_error(Error::invalid_ref("Unknown ref flag for union"));
+      return default_value();
+    }
+    if (ctx.track_ref() && ref_flag == REF_VALUE_FLAG) {
+      ctx.ref_reader().reserve_ref_id();
+    }
+    if (read_type) {
+      read_type_info(ctx);
+      if (FORY_PREDICT_FALSE(ctx.has_error())) {
+        return default_value();
+      }
+    }
+    return read_data(ctx);
+  }
+
+  static inline T read_data(ReadContext &ctx) {
+    uint32_t case_id = ctx.read_var_uint32(ctx.error());
+    if (FORY_PREDICT_FALSE(ctx.has_error())) {
+      return default_value();
+    }
+    T result{};
+    bool matched = detail::dispatch_union_case<T>(case_id, [&](auto tag) {
+      constexpr size_t index = decltype(tag)::value;
+      using CaseT = typename detail::UnionInfo<T>::template CaseT<index>;
+      constexpr ::fory::FieldMeta meta =
+          detail::UnionInfo<T>::template Meta<index>::value;
+      using SpecProvider = detail::UnionCaseSpecProvider<T, index>;
+      constexpr uint32_t field_type_id =
+          detail::resolve_union_type_id_for_spec<CaseT, SpecProvider>(meta);
+      constexpr bool configured =
+          detail::union_node_has_override<SpecProvider, 0>();
+      const bool manual =
+          configured || detail::needs_manual_encoding<CaseT>(meta);
+      constexpr bool nullable =
+          meta.nullable_ || is_nullable_v<detail::decay_t<CaseT>>;
+      const RefMode value_ref_mode =
+          meta.ref_ ? RefMode::Tracking : RefMode::NullOnly;
+
+      if (manual) {
+        bool is_null = false;
+        if (!detail::read_union_ref_flag(ctx, value_ref_mode, nullable,
+                                         is_null)) {
+          result = default_value();
+          return;
+        }
+        if (is_null) {
+          result = detail::UnionInfo<T>::template make<index>(
+              detail::default_union_case_value<CaseT>());
+          return;
+        }
+        uint32_t actual_type_id = ctx.read_uint8(ctx.error());
+        if (FORY_PREDICT_FALSE(ctx.has_error())) {
+          result = default_value();
+          return;
+        }
+        if (!type_id_matches(actual_type_id, field_type_id)) {
+          ctx.set_error(Error::type_mismatch(actual_type_id, field_type_id));
+          result = default_value();
+          return;
+        }
+        CaseT value = [&]() {
+          if constexpr (detail::union_node_has_override<SpecProvider, 0>()) {
+            return detail::read_union_configured_value<CaseT, SpecProvider, 0>(
+                ctx, RefMode::None, false);
+          } else {
+            return detail::read_union_value_data<CaseT>(ctx, field_type_id);
+          }
+        }();
+        if (FORY_PREDICT_FALSE(ctx.has_error())) {
+          result = default_value();
+          return;
+        }
+        result = detail::UnionInfo<T>::template make<index>(std::move(value));
+        return;
+      }
+
+      CaseT value = Serializer<CaseT>::read(ctx, value_ref_mode, true);
+      if (FORY_PREDICT_FALSE(ctx.has_error())) {
+        result = default_value();
+        return;
+      }
+      result = detail::UnionInfo<T>::template make<index>(std::move(value));
+    });
+
+    if (FORY_PREDICT_FALSE(!matched)) {
+      // skip unknown case value (Any-style)
+      int8_t ref_flag = ctx.read_int8(ctx.error());
+      if (FORY_PREDICT_FALSE(ctx.has_error())) {
+        return default_value();
+      }
+      if (ref_flag == NULL_FLAG) {
+        ctx.set_error(Error::invalid_data("Unknown union case id"));
+        return default_value();
+      }
+      if (ref_flag == REF_FLAG) {
+        (void)ctx.read_var_uint32(ctx.error());
+        ctx.set_error(Error::invalid_data("Unknown union case id"));
+        return default_value();
+      }
+      if (ref_flag != NOT_NULL_VALUE_FLAG && ref_flag != REF_VALUE_FLAG) {
+        ctx.set_error(
+            Error::invalid_data("Unknown reference flag in union value"));
+        return default_value();
+      }
+      const TypeInfo *type_info = ctx.read_any_type_info(ctx.error());
+      if (FORY_PREDICT_FALSE(ctx.has_error())) {
+        return default_value();
+      }
+      if (!type_info) {
+        ctx.set_error(Error::type_error("TypeInfo not found for union skip"));
+        return default_value();
+      }
+      FieldType field_type;
+      field_type.set_type_id(type_info->type_id);
+      field_type.nullable = false;
+      skip_field_value(ctx, field_type, RefMode::None);
+      ctx.set_error(Error::invalid_data("Unknown union case id"));
+      return default_value();
+    }
+
+    return result;
+  }
+
+  static inline T read_with_type_info(ReadContext &ctx, RefMode ref_mode,
+                                      const TypeInfo &) {
+    return read(ctx, ref_mode, false);
+  }
+
+private:
+  static inline T default_value() {
+    using DefaultType = typename detail::UnionInfo<T>::template CaseT<0>;
+    return detail::UnionInfo<T>::template make<0>(DefaultType{});
+  }
+};
+
+// ============================================================================//
+// Union registration macros for generated code
+// ============================================================================//
+
+#define FORY_UNION_TUPLE_SIZE(tuple) FORY_UNION_TUPLE_SIZE_IMPL tuple
+#define FORY_UNION_TUPLE_SIZE_IMPL(...)                                        \
+  FORY_UNION_TUPLE_SIZE_SELECT(__VA_ARGS__, 3, 2, 1, 0)
+#define FORY_UNION_TUPLE_SIZE_SELECT(_1, _2, _3, N, ...) N
+
+#define FORY_UNION_CASE_NAME(tuple)                                            \
+  FORY_PP_CONCAT(FORY_UNION_CASE_NAME_, FORY_UNION_TUPLE_SIZE(tuple))(tuple)
+#define FORY_UNION_CASE_NAME_2(tuple) FORY_UNION_CASE_NAME_2_IMPL tuple
+#define FORY_UNION_CASE_NAME_2_IMPL(name, meta) name
+#define FORY_UNION_CASE_NAME_3(tuple) FORY_UNION_CASE_NAME_3_IMPL tuple
+#define FORY_UNION_CASE_NAME_3_IMPL(name, type, meta) name
+
+#define FORY_UNION_CASE_TYPE(Type, tuple)                                      \
+  FORY_PP_CONCAT(FORY_UNION_CASE_TYPE_, FORY_UNION_TUPLE_SIZE(tuple))          \
+  (Type, tuple)
+#define FORY_UNION_CASE_TYPE_2(Type, tuple)                                    \
+  FORY_UNION_CASE_TYPE_2_IMPL(Type, tuple)
+#define FORY_UNION_CASE_TYPE_2_IMPL(Type, tuple)                               \
+  typename ::fory::serialization::detail::UnionFactoryArg<                     \
+      decltype(&Type::FORY_UNION_CASE_NAME(tuple))>::type
+#define FORY_UNION_CASE_TYPE_3(Type, tuple) FORY_UNION_CASE_TYPE_3_IMPL tuple
+#define FORY_UNION_CASE_TYPE_3_IMPL(name, type, meta) type
+
+#define FORY_UNION_CASE_META(tuple)                                            \
+  FORY_PP_CONCAT(FORY_UNION_CASE_META_, FORY_UNION_TUPLE_SIZE(tuple))(tuple)
+#define FORY_UNION_CASE_META_2(tuple) FORY_UNION_CASE_META_2_IMPL tuple
+#define FORY_UNION_CASE_META_2_IMPL(name, meta) meta
+#define FORY_UNION_CASE_META_3(tuple) FORY_UNION_CASE_META_3_IMPL tuple
+#define FORY_UNION_CASE_META_3_IMPL(name, type, meta) meta
+
+#define FORY_UNION_PP_FOREACH_2(M, A, ...)                                     \
+  FORY_PP_INVOKE(FORY_PP_CONCAT(FORY_UNION_PP_FOREACH_2_IMPL_,                 \
+                                FORY_PP_NARG(__VA_ARGS__)),                    \
+                 M, A, __VA_ARGS__)
+
+#define FORY_UNION_PP_FOREACH_2_IMPL_1(M, A, _1) M(A, _1)
+#define FORY_UNION_PP_FOREACH_2_IMPL_2(M, A, _1, _2) M(A, _1) M(A, _2)
+#define FORY_UNION_PP_FOREACH_2_IMPL_3(M, A, _1, _2, _3)                       \
+  M(A, _1) M(A, _2) M(A, _3)
+#define FORY_UNION_PP_FOREACH_2_IMPL_4(M, A, _1, _2, _3, _4)                   \
+  M(A, _1) M(A, _2) M(A, _3) M(A, _4)
+#define FORY_UNION_PP_FOREACH_2_IMPL_5(M, A, _1, _2, _3, _4, _5)               \
+  M(A, _1) M(A, _2) M(A, _3) M(A, _4) M(A, _5)
+#define FORY_UNION_PP_FOREACH_2_IMPL_6(M, A, _1, _2, _3, _4, _5, _6)           \
+  M(A, _1) M(A, _2) M(A, _3) M(A, _4) M(A, _5) M(A, _6)
+#define FORY_UNION_PP_FOREACH_2_IMPL_7(M, A, _1, _2, _3, _4, _5, _6, _7)       \
+  M(A, _1) M(A, _2) M(A, _3) M(A, _4) M(A, _5) M(A, _6) M(A, _7)
+#define FORY_UNION_PP_FOREACH_2_IMPL_8(M, A, _1, _2, _3, _4, _5, _6, _7, _8)   \
+  M(A, _1) M(A, _2) M(A, _3) M(A, _4) M(A, _5) M(A, _6) M(A, _7) M(A, _8)
+#define FORY_UNION_PP_FOREACH_2_IMPL_9(M, A, _1, _2, _3, _4, _5, _6, _7, _8,   \
+                                       _9)                                     \
+  M(A, _1)                                                                     \
+  M(A, _2) M(A, _3) M(A, _4) M(A, _5) M(A, _6) M(A, _7) M(A, _8) M(A, _9)
+#define FORY_UNION_PP_FOREACH_2_IMPL_10(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10)                               \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3) M(A, _4) M(A, _5) M(A, _6) M(A, _7) M(A, _8) M(A, _9) M(A, _10)
+#define FORY_UNION_PP_FOREACH_2_IMPL_11(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10, _11)                          \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3)                                                                     \
+  M(A, _4) M(A, _5) M(A, _6) M(A, _7) M(A, _8) M(A, _9) M(A, _10) M(A, _11)
+#define FORY_UNION_PP_FOREACH_2_IMPL_12(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10, _11, _12)                     \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3)                                                                     \
+  M(A, _4)                                                                     \
+  M(A, _5) M(A, _6) M(A, _7) M(A, _8) M(A, _9) M(A, _10) M(A, _11) M(A, _12)
+#define FORY_UNION_PP_FOREACH_2_IMPL_13(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10, _11, _12, _13)                \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3)                                                                     \
+  M(A, _4)                                                                     \
+  M(A, _5)                                                                     \
+  M(A, _6) M(A, _7) M(A, _8) M(A, _9) M(A, _10) M(A, _11) M(A, _12) M(A, _13)
+#define FORY_UNION_PP_FOREACH_2_IMPL_14(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10, _11, _12, _13, _14)           \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3)                                                                     \
+  M(A, _4)                                                                     \
+  M(A, _5)                                                                     \
+  M(A, _6)                                                                     \
+  M(A, _7) M(A, _8) M(A, _9) M(A, _10) M(A, _11) M(A, _12) M(A, _13) M(A, _14)
+#define FORY_UNION_PP_FOREACH_2_IMPL_15(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10, _11, _12, _13, _14, _15)      \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3)                                                                     \
+  M(A, _4)                                                                     \
+  M(A, _5)                                                                     \
+  M(A, _6)                                                                     \
+  M(A, _7)                                                                     \
+  M(A, _8) M(A, _9) M(A, _10) M(A, _11) M(A, _12) M(A, _13) M(A, _14) M(A, _15)
+#define FORY_UNION_PP_FOREACH_2_IMPL_16(M, A, _1, _2, _3, _4, _5, _6, _7, _8,  \
+                                        _9, _10, _11, _12, _13, _14, _15, _16) \
+  M(A, _1)                                                                     \
+  M(A, _2)                                                                     \
+  M(A, _3)                                                                     \
+  M(A, _4)                                                                     \
+  M(A, _5)                                                                     \
+  M(A, _6)                                                                     \
+  M(A, _7)                                                                     \
+  M(A, _8)                                                                     \
+  M(A, _9) M(A, _10) M(A, _11) M(A, _12) M(A, _13) M(A, _14) M(A, _15) M(A, _16)
+
+#define FORY_UNION_PP_FOREACH_2_COMMA(M, A, ...)                               \
+  FORY_PP_INVOKE(FORY_PP_CONCAT(FORY_UNION_PP_FOREACH_2_COMMA_IMPL_,           \
+                                FORY_PP_NARG(__VA_ARGS__)),                    \
+                 M, A, __VA_ARGS__)
+
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_1(M, A, _1) M(A, _1)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_2(M, A, _1, _2) M(A, _1), M(A, _2)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_3(M, A, _1, _2, _3)                 \
+  M(A, _1), M(A, _2), M(A, _3)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_4(M, A, _1, _2, _3, _4)             \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_5(M, A, _1, _2, _3, _4, _5)         \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_6(M, A, _1, _2, _3, _4, _5, _6)     \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_7(M, A, _1, _2, _3, _4, _5, _6, _7) \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_8(M, A, _1, _2, _3, _4, _5, _6, _7, \
+                                             _8)                               \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7), M(A, _8)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_9(M, A, _1, _2, _3, _4, _5, _6, _7, \
+                                             _8, _9)                           \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_10(M, A, _1, _2, _3, _4, _5, _6,    \
+                                              _7, _8, _9, _10)                 \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_11(M, A, _1, _2, _3, _4, _5, _6,    \
+                                              _7, _8, _9, _10, _11)            \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10), M(A, _11)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_12(M, A, _1, _2, _3, _4, _5, _6,    \
+                                              _7, _8, _9, _10, _11, _12)       \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10), M(A, _11), M(A, _12)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_13(M, A, _1, _2, _3, _4, _5, _6,    \
+                                              _7, _8, _9, _10, _11, _12, _13)  \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10), M(A, _11), M(A, _12), M(A, _13)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_14(                                 \
+    M, A, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14)         \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10), M(A, _11), M(A, _12), M(A, _13),          \
+      M(A, _14)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_15(                                 \
+    M, A, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15)    \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10), M(A, _11), M(A, _12), M(A, _13),          \
+      M(A, _14), M(A, _15)
+#define FORY_UNION_PP_FOREACH_2_COMMA_IMPL_16(M, A, _1, _2, _3, _4, _5, _6,    \
+                                              _7, _8, _9, _10, _11, _12, _13,  \
+                                              _14, _15, _16)                   \
+  M(A, _1), M(A, _2), M(A, _3), M(A, _4), M(A, _5), M(A, _6), M(A, _7),        \
+      M(A, _8), M(A, _9), M(A, _10), M(A, _11), M(A, _12), M(A, _13),          \
+      M(A, _14), M(A, _15), M(A, _16)
+
+#define FORY_UNION_CASE_ID(Type, tuple)                                        \
+  static_cast<::std::uint32_t>(FORY_UNION_CASE_META(tuple).id_)
+
+#define FORY_UNION_CASE_REQUIRE_ID(Type, tuple)                                \
+  static_assert(FORY_UNION_CASE_META(tuple).has_id_,                           \
+                "FORY_UNION cases must use fory::F(id)");
+
+#define FORY_UNION_CASE_ID_ENTRY(Type, tuple) FORY_UNION_CASE_ID(Type, tuple),
+
+#define FORY_UNION_CASE_TYPE_VALUE(Type, tuple)                                \
+  FORY_UNION_CASE_TYPE(Type, tuple)
+#define FORY_UNION_CASE_META_VALUE(Type, tuple) FORY_UNION_CASE_META(tuple)
+#define FORY_UNION_CASE_ID_VALUE(Type, tuple) FORY_UNION_CASE_ID(Type, tuple)
+#define FORY_UNION_CASE_FACTORY_VALUE(Type, tuple)                             \
+  static_cast<Type (*)(FORY_UNION_CASE_TYPE(Type, tuple))>(                    \
+      &Type::FORY_UNION_CASE_NAME(tuple))
+
+#define FORY_UNION_IDS_DESCRIPTOR_NAME(line)                                   \
+  FORY_PP_CONCAT(ForyUnionCaseIdsDescriptor_, line)
+
+#define FORY_UNION_CASE_DESCRIPTOR_NAME(line)                                  \
+  FORY_PP_CONCAT(ForyUnionCaseMetaDescriptor_, line)
+
+#define FORY_UNION_DESCRIPTOR_NAME(line)                                       \
+  FORY_PP_CONCAT(ForyUnionInfoDescriptor_, line)
+
+#define FORY_UNION_IDS(Type, ...)                                              \
+  struct FORY_UNION_IDS_DESCRIPTOR_NAME(__LINE__) {                            \
+    static inline constexpr ::std::uint32_t case_ids[] = {__VA_ARGS__};        \
+    static constexpr ::std::size_t case_count =                                \
+        sizeof(case_ids) / sizeof(case_ids[0]);                                \
+  };                                                                           \
+  constexpr auto fory_union_case_ids(::fory::meta::Identity<Type>) {           \
+    return FORY_UNION_IDS_DESCRIPTOR_NAME(__LINE__){};                         \
+  }                                                                            \
+  static_assert(true)
+
+#define FORY_UNION_CASE(Type, CaseId, CaseType, Factory, MetaExpr)             \
+  static_assert((MetaExpr).has_id_,                                            \
+                "FORY_UNION_CASE metadata must use fory::F(id)");              \
+  struct FORY_UNION_CASE_DESCRIPTOR_NAME(__LINE__) {                           \
+    using CaseT = CaseType;                                                    \
+    static constexpr ::fory::FieldMeta meta = MetaExpr;                        \
+    static inline Type make(CaseT value) {                                     \
+      return Factory(::std::move(value));                                      \
+    }                                                                          \
+  };                                                                           \
+  constexpr auto fory_union_case_meta(                                         \
+      ::fory::meta::Identity<Type>,                                            \
+      ::std::integral_constant<::std::uint32_t, CaseId>) {                     \
+    return FORY_UNION_CASE_DESCRIPTOR_NAME(__LINE__){};                        \
+  }                                                                            \
+  static_assert(true)
+
+#define FORY_UNION(Type, ...)                                                  \
+  static_assert(FORY_PP_NARG(__VA_ARGS__) <= 16,                               \
+                "FORY_UNION supports up to 16 cases; use "                     \
+                "FORY_UNION_IDS/FORY_UNION_CASE "                              \
+                "for larger unions");                                          \
+  FORY_UNION_PP_FOREACH_2(FORY_UNION_CASE_REQUIRE_ID, Type, __VA_ARGS__)       \
+  struct FORY_UNION_DESCRIPTOR_NAME(__LINE__) {                                \
+    using UnionType = Type;                                                    \
+    static constexpr ::std::size_t case_count = FORY_PP_NARG(__VA_ARGS__);     \
+    using CaseTypes = ::std::tuple<FORY_UNION_PP_FOREACH_2_COMMA(              \
+        FORY_UNION_CASE_TYPE_VALUE, Type, __VA_ARGS__)>;                       \
+    static inline constexpr ::std::array<::std::uint32_t, case_count>          \
+        case_ids = {FORY_UNION_PP_FOREACH_2_COMMA(FORY_UNION_CASE_ID_VALUE,    \
+                                                  Type, __VA_ARGS__)};         \
+    static inline constexpr ::std::array<::fory::FieldMeta, case_count>        \
+        case_metas = {FORY_UNION_PP_FOREACH_2_COMMA(                           \
+            FORY_UNION_CASE_META_VALUE, Type, __VA_ARGS__)};                   \
+    static inline constexpr auto factories =                                   \
+        ::std::make_tuple(FORY_UNION_PP_FOREACH_2_COMMA(                       \
+            FORY_UNION_CASE_FACTORY_VALUE, Type, __VA_ARGS__));                \
+  };                                                                           \
+  constexpr auto fory_union_info(::fory::meta::Identity<Type>) {               \
+    return FORY_UNION_DESCRIPTOR_NAME(__LINE__){};                             \
+  }                                                                            \
+  static_assert(true)
+
+} // namespace serialization
+} // namespace fory

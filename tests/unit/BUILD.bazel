@@ -1,0 +1,9 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+py_test(
+    name = "foryc_tool_test",
+    srcs = ["foryc_tool_test.py"],
+    deps = ["//fory/tools:foryc_tool_lib"],
+)

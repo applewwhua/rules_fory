@@ -1,0 +1,23 @@
+package(default_visibility = ["//visibility:public"])
+
+load(":foryc_toolchain.bzl", "foryc_toolchain")
+
+toolchain_type(
+    name = "foryc_toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
+foryc_toolchain(
+    name = "local_foryc_impl",
+    foryc = select({
+        "@platforms//os:windows": "@foryc//:foryc.bat",
+        "//conditions:default": "@foryc//:foryc.sh",
+    }),
+)
+
+toolchain(
+    name = "local_foryc",
+    toolchain = ":local_foryc_impl",
+    toolchain_type = ":foryc_toolchain_type",
+    visibility = ["//visibility:public"],
+)

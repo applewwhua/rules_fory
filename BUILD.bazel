@@ -1,0 +1,18 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "MODULE.bazel",
+    "README.md",
+])
+
+filegroup(
+    name = "all_files",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "bazel-*",
+            "**/.*",
+            "**/__pycache__/**",
+        ],
+    ),
+)

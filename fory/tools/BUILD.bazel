@@ -1,0 +1,16 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Exposed as a library so that tests can import the helper functions.
+py_library(
+    name = "foryc_tool_lib",
+    srcs = ["foryc_tool.py"],
+    imports = ["."],
+)
+
+py_binary(
+    name = "foryc_tool",
+    srcs = ["foryc_tool.py"],
+    main = "foryc_tool.py",
+)

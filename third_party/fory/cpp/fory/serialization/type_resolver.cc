@@ -1,0 +1,1976 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include "fory/serialization/type_resolver.h"
+#include "fory/meta/meta_string.h"
+#include "fory/serialization/compatible_scalar.h"
+#include "fory/serialization/context.h"
+#include "fory/thirdparty/MurmurHash3.h"
+#include "fory/type/type.h"
+#include <algorithm>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <map>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace fory {
+namespace serialization {
+
+using namespace meta;
+
+// Constants from xlang spec
+constexpr size_t SMALL_NUM_FIELDS_THRESHOLD = 0b11111;
+constexpr uint8_t REGISTER_BY_NAME_FLAG = 0b100000;
+constexpr uint8_t COMPATIBLE_TYPEDEF_FLAG = 0b01000000;
+constexpr uint8_t STRUCT_TYPEDEF_FLAG = 0b10000000;
+constexpr uint8_t NON_STRUCT_RESERVED_BITS_MASK = 0b01110000;
+constexpr size_t FIELD_NAME_SIZE_THRESHOLD = 0b1111;
+constexpr size_t BIG_NAME_THRESHOLD = 0b111111;
+constexpr uint64_t META_SIZE_MASK = 0xff;
+constexpr uint64_t COMPRESS_META_FLAG = 0x100;
+constexpr uint64_t TYPE_META_RESERVED_BITS_MASK = 0xe00;
+constexpr int8_t NUM_HASH_BITS = 52;
+constexpr uint32_t TYPE_META_HASH_SHIFT = 64 - NUM_HASH_BITS;
+constexpr uint64_t TYPE_META_HASH_BITS_MASK = ~uint64_t{0}
+                                              << TYPE_META_HASH_SHIFT;
+
+// ============================================================================
+// FieldType Implementation
+// ============================================================================
+
+Result<void, Error> FieldType::write_to(Buffer &buffer, bool write_flag,
+                                        bool nullable_val) const {
+  uint32_t header = type_id;
+  if (write_flag) {
+    header <<= 2;
+    if (nullable_val) {
+      header |= 2;
+    }
+    buffer.write_var_uint32(header);
+  } else {
+    buffer.write_uint8(static_cast<uint8_t>(header));
+  }
+
+  // write generics for list/set/map
+  if (type_id == static_cast<uint32_t>(TypeId::LIST) ||
+      type_id == static_cast<uint32_t>(TypeId::SET)) {
+    if (generics.empty()) {
+      return Unexpected(Error::invalid("List/Set must have element type"));
+    }
+    FORY_RETURN_IF_ERROR(
+        generics[0].write_to(buffer, true, generics[0].nullable));
+  } else if (type_id == static_cast<uint32_t>(TypeId::MAP)) {
+    if (generics.size() < 2) {
+      return Unexpected(Error::invalid("Map must have key and value types"));
+    }
+    FORY_RETURN_IF_ERROR(
+        generics[0].write_to(buffer, true, generics[0].nullable));
+    FORY_RETURN_IF_ERROR(
+        generics[1].write_to(buffer, true, generics[1].nullable));
+  }
+
+  return {};
+}
+
+Result<FieldType, Error> FieldType::read_from(Buffer &buffer, bool read_flag,
+                                              bool nullable_val,
+                                              bool ref_tracking_val) {
+  struct ParseFrame {
+    FieldType field_type;
+    uint8_t remaining_generics;
+  };
+
+  // A capped TypeMeta body can still encode thousands of nested container
+  // schemas, so input bytes rather than the native call stack bound parsing.
+  std::vector<ParseFrame> stack;
+  bool nested = false;
+  while (true) {
+    Error error;
+    const uint32_t header = nested ? buffer.read_var_uint32(error)
+                                   : (read_flag ? buffer.read_var_uint32(error)
+                                                : buffer.read_uint8(error));
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+
+    const bool header_has_flags = nested || read_flag;
+    const uint32_t tid = header_has_flags ? header >> 2 : header;
+    const bool null = header_has_flags ? (header & 0b10) != 0 : nullable_val;
+    const bool ref_track =
+        header_has_flags ? (header & 0b01) != 0 : ref_tracking_val;
+
+    FieldType completed(tid, null, ref_track);
+    completed.user_type_id = kInvalidUserTypeId;
+
+    uint8_t generic_count = 0;
+    if (tid == static_cast<uint32_t>(TypeId::LIST) ||
+        tid == static_cast<uint32_t>(TypeId::SET)) {
+      generic_count = 1;
+    } else if (tid == static_cast<uint32_t>(TypeId::MAP)) {
+      generic_count = 2;
+    }
+
+    if (generic_count != 0) {
+      stack.push_back({std::move(completed), generic_count});
+      nested = true;
+      continue;
+    }
+
+    while (!stack.empty()) {
+      ParseFrame &parent = stack.back();
+      parent.field_type.add_generic(std::move(completed));
+      --parent.remaining_generics;
+      if (parent.remaining_generics != 0) {
+        break;
+      }
+      completed = std::move(parent.field_type);
+      stack.pop_back();
+    }
+    if (stack.empty()) {
+      return completed;
+    }
+    nested = true;
+  }
+}
+
+// ============================================================================
+// FieldInfo Implementation
+// ============================================================================
+
+Result<std::vector<uint8_t>, Error> FieldInfo::to_bytes() const {
+  Buffer buffer;
+
+  // write field header:
+  // header: | field_name_encoding:2bits | size:4bits | nullability:1bit |
+  // track_ref:1bit |
+  if (FORY_PREDICT_FALSE(field_id < detail::kFieldNameIdentity ||
+                         field_id > detail::kMaxFieldTag)) {
+    return Unexpected(
+        Error::invalid("Field tag exceeds the wire TAG_ID range"));
+  }
+  const bool use_tag_id = field_id != detail::kFieldNameIdentity;
+  uint8_t encoding_idx = use_tag_id ? 3 : 0; // TAG_ID or UTF8
+  std::vector<uint8_t> encoded_name;
+  if (!use_tag_id) {
+    static const MetaStringEncoder k_field_name_encoder('$', '_');
+    static const std::vector<MetaEncoding> k_field_name_encoding_list = {
+        MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+        MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL};
+
+    FORY_TRY(encoded, k_field_name_encoder.encode(field_name,
+                                                  k_field_name_encoding_list));
+    switch (encoded.encoding) {
+    case MetaEncoding::UTF8:
+      encoding_idx = 0;
+      break;
+    case MetaEncoding::ALL_TO_LOWER_SPECIAL:
+      encoding_idx = 1;
+      break;
+    case MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL:
+      encoding_idx = 2;
+      break;
+    default:
+      return Unexpected(Error::encoding_error(
+          "Unsupported field name encoding: " +
+          std::to_string(static_cast<int>(encoded.encoding))));
+    }
+    encoded_name = std::move(encoded.bytes);
+  }
+  const uint32_t tag_id = use_tag_id ? static_cast<uint32_t>(field_id) : 0;
+  const size_t name_size_field = use_tag_id ? 0 : encoded_name.size() - 1;
+  const uint8_t inline_size =
+      use_tag_id ? std::min<uint32_t>(FIELD_NAME_SIZE_THRESHOLD, tag_id)
+                 : static_cast<uint8_t>(std::min<size_t>(
+                       FIELD_NAME_SIZE_THRESHOLD, name_size_field));
+  uint8_t header = (inline_size << 2) & 0x3C;
+
+  if (field_type.track_ref) {
+    header |= 1; // bit 0 for ref tracking
+  }
+  if (field_type.nullable) {
+    header |= 2; // bit 1 for nullable
+  }
+  header |= (encoding_idx << 6);
+
+  buffer.write_uint8(header);
+
+  if (use_tag_id && tag_id >= FIELD_NAME_SIZE_THRESHOLD) {
+    buffer.write_var_uint32(
+        static_cast<uint32_t>(tag_id - FIELD_NAME_SIZE_THRESHOLD));
+  } else if (!use_tag_id && name_size_field >= FIELD_NAME_SIZE_THRESHOLD) {
+    buffer.write_var_uint32(
+        static_cast<uint32_t>(name_size_field - FIELD_NAME_SIZE_THRESHOLD));
+  }
+
+  // write field type
+  FORY_RETURN_NOT_OK(field_type.write_to(buffer, false, field_type.nullable));
+
+  // write field name only when tag ID is not used.
+  if (!use_tag_id) {
+    buffer.write_bytes(encoded_name.data(), encoded_name.size());
+  }
+
+  return std::vector<uint8_t>(buffer.data(),
+                              buffer.data() + buffer.writer_index());
+}
+
+Result<FieldInfo, Error> FieldInfo::from_bytes(Buffer &buffer) {
+  // Read field header
+  Error error;
+  uint8_t header = buffer.read_uint8(error);
+  if (FORY_PREDICT_FALSE(!error.ok())) {
+    return Unexpected(std::move(error));
+  }
+
+  // Decode header layout:
+  // bit  0: ref tracking flag
+  // bit  1: nullability flag
+  // bits 2-5: size (0-14, 15 means extended)
+  // bits 6-7: field name encoding index
+  uint8_t encoding_idx = static_cast<uint8_t>(header >> 6);
+  bool use_tag_id = encoding_idx == 3;
+  bool track_ref = (header & 0b01u) != 0;
+  bool nullable = (header & 0b10u) != 0;
+  const uint32_t inline_size = (header >> 2) & FIELD_NAME_SIZE_THRESHOLD;
+  uint32_t tag_id = use_tag_id ? inline_size : 0;
+  size_t name_size_field = use_tag_id ? 0 : inline_size;
+  if (inline_size == FIELD_NAME_SIZE_THRESHOLD) {
+    uint32_t extra = buffer.read_var_uint32(error);
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+    if (use_tag_id) {
+      if (FORY_PREDICT_FALSE(extra >
+                             static_cast<uint32_t>(detail::kMaxFieldTag) -
+                                 inline_size)) {
+        return Unexpected(
+            Error::invalid_data("Field tag exceeds the wire TAG_ID range"));
+      }
+      tag_id += extra;
+    } else {
+      name_size_field += extra;
+    }
+  }
+
+  // Read field type with nullable and track_ref from header
+  FORY_TRY(field_type,
+           FieldType::read_from(buffer, false, nullable, track_ref));
+
+  if (use_tag_id) {
+    FieldInfo info("", std::move(field_type));
+    info.field_id = static_cast<int32_t>(tag_id);
+    return info;
+  }
+
+  // Read and decode field name. Java encodes field names using
+  // MetaString with encodings:
+  //   UTF8 / ALL_TO_LOWER_SPECIAL / LOWER_UPPER_DIGIT_SPECIAL
+  // and writes the encoding index into the top 2 bits.
+  // We mirror that here using MetaStringDecoder with '$' and '_' as
+  // special characters (same as Encoders.FIELD_NAME_DECODER).
+
+  const size_t name_size = name_size_field + 1;
+  if (FORY_PREDICT_FALSE(
+          name_size >
+          static_cast<size_t>(std::numeric_limits<uint32_t>::max()))) {
+    return Unexpected(
+        Error::invalid_data("Field name size exceeds uint32 range"));
+  }
+  if (FORY_PREDICT_FALSE(
+          !buffer.ensure_readable(static_cast<uint32_t>(name_size), error))) {
+    return Unexpected(std::move(error));
+  }
+  std::vector<uint8_t> name_bytes(name_size);
+  buffer.read_bytes(name_bytes.data(), static_cast<uint32_t>(name_size), error);
+  if (FORY_PREDICT_FALSE(!error.ok())) {
+    return Unexpected(std::move(error));
+  }
+
+  static const MetaStringDecoder k_field_name_decoder('$', '_');
+  static const MetaEncoding k_field_name_encodings[] = {
+      MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+      MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL};
+  if (encoding_idx >=
+      sizeof(k_field_name_encodings) / sizeof(k_field_name_encodings[0])) {
+    return Unexpected(
+        Error::encoding_error("Invalid field name encoding index: " +
+                              std::to_string(static_cast<int>(encoding_idx))));
+  }
+  MetaEncoding encoding = k_field_name_encodings[encoding_idx];
+  FORY_TRY(decoded_name, k_field_name_decoder.decode(
+                             name_bytes.data(), name_bytes.size(), encoding));
+
+  return FieldInfo(decoded_name, std::move(field_type));
+}
+
+// ============================================================================
+// TypeMeta Implementation
+// ============================================================================
+
+namespace {
+
+// Meta string encodings for namespace and type name, aligned with
+// rust/fory-core/src/meta/type_meta.rs and Java Encoders.
+static const MetaEncoding k_namespace_encodings[] = {
+    MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+    MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL};
+
+static const MetaEncoding k_type_name_encodings[] = {
+    MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+    MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL,
+    MetaEncoding::FIRST_TO_LOWER_SPECIAL};
+
+static const std::vector<MetaEncoding> k_namespace_encoding_list = {
+    MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+    MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL};
+
+static const std::vector<MetaEncoding> k_type_name_encoding_list = {
+    MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+    MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL,
+    MetaEncoding::FIRST_TO_LOWER_SPECIAL};
+
+static const MetaStringEncoder k_namespace_encoder('.', '_');
+static const MetaStringEncoder k_type_name_encoder('$', '_');
+
+inline Result<uint8_t, Error> encoding_to_index(MetaEncoding encoding,
+                                                const MetaEncoding *encodings,
+                                                size_t enc_count) {
+  for (size_t i = 0; i < enc_count; ++i) {
+    if (encodings[i] == encoding) {
+      return static_cast<uint8_t>(i);
+    }
+  }
+  return Unexpected(
+      Error::encoding_error("Unsupported meta string encoding: " +
+                            std::to_string(static_cast<int>(encoding))));
+}
+
+inline Result<void, Error>
+write_meta_name(Buffer &buffer, const std::string &name,
+                const MetaStringEncoder &encoder,
+                const std::vector<MetaEncoding> &allowed_encodings,
+                const MetaEncoding *encodings, size_t enc_count) {
+  FORY_TRY(encoded, encoder.encode(name, allowed_encodings));
+  FORY_TRY(encoding_idx,
+           encoding_to_index(encoded.encoding, encodings, enc_count));
+  const size_t len = encoded.bytes.size();
+
+  if (len >= BIG_NAME_THRESHOLD) {
+    uint8_t header =
+        static_cast<uint8_t>((BIG_NAME_THRESHOLD << 2) | encoding_idx);
+    buffer.write_uint8(header);
+    buffer.write_var_uint32(static_cast<uint32_t>(len - BIG_NAME_THRESHOLD));
+  } else {
+    uint8_t header = static_cast<uint8_t>((len << 2) | encoding_idx);
+    buffer.write_uint8(header);
+  }
+
+  if (len > 0) {
+    buffer.write_bytes(encoded.bytes.data(), static_cast<uint32_t>(len));
+  }
+  return Result<void, Error>();
+}
+
+inline bool is_compatible_struct_type_id(uint32_t type_id) {
+  return type_id == static_cast<uint32_t>(TypeId::COMPATIBLE_STRUCT) ||
+         type_id == static_cast<uint32_t>(TypeId::NAMED_COMPATIBLE_STRUCT);
+}
+
+inline Result<uint8_t, Error> type_meta_kind_code(uint32_t type_id) {
+  switch (static_cast<TypeId>(type_id)) {
+  case TypeId::ENUM:
+    return static_cast<uint8_t>(0);
+  case TypeId::NAMED_ENUM:
+    return static_cast<uint8_t>(1);
+  case TypeId::EXT:
+    return static_cast<uint8_t>(2);
+  case TypeId::NAMED_EXT:
+    return static_cast<uint8_t>(3);
+  case TypeId::TYPED_UNION:
+    return static_cast<uint8_t>(4);
+  case TypeId::NAMED_UNION:
+    return static_cast<uint8_t>(5);
+  default:
+    return Unexpected(Error::type_error("Unsupported TypeMeta kind"));
+  }
+}
+
+inline Result<uint32_t, Error> type_id_from_type_meta_kind(uint8_t kind_code) {
+  switch (kind_code) {
+  case 0:
+    return static_cast<uint32_t>(TypeId::ENUM);
+  case 1:
+    return static_cast<uint32_t>(TypeId::NAMED_ENUM);
+  case 2:
+    return static_cast<uint32_t>(TypeId::EXT);
+  case 3:
+    return static_cast<uint32_t>(TypeId::NAMED_EXT);
+  case 4:
+    return static_cast<uint32_t>(TypeId::TYPED_UNION);
+  case 5:
+    return static_cast<uint32_t>(TypeId::NAMED_UNION);
+  default:
+    return Unexpected(Error::invalid_data("Unsupported TypeMeta kind code"));
+  }
+}
+
+inline uint64_t compute_type_meta_hash_bits(const uint8_t *meta_bytes,
+                                            size_t meta_size,
+                                            uint64_t header_low_bits) {
+  std::vector<uint8_t> hash_input(meta_size + 2);
+  std::memcpy(hash_input.data(), meta_bytes, meta_size);
+  hash_input[meta_size] = static_cast<uint8_t>(header_low_bits);
+  hash_input[meta_size + 1] = static_cast<uint8_t>(header_low_bits >> 8);
+  int64_t hash_out[2] = {0, 0};
+  MurmurHash3_x64_128(hash_input.data(), static_cast<int>(hash_input.size()),
+                      47, hash_out);
+  uint64_t shifted = static_cast<uint64_t>(hash_out[0]) << TYPE_META_HASH_SHIFT;
+  if (static_cast<int64_t>(shifted) < 0) {
+    shifted = ~shifted + 1;
+  }
+  return shifted & TYPE_META_HASH_BITS_MASK;
+}
+
+inline int64_t compute_type_meta_hash(const uint8_t *meta_bytes,
+                                      size_t meta_size) {
+  uint64_t header_low_bits =
+      std::min<uint64_t>(META_SIZE_MASK, static_cast<uint64_t>(meta_size));
+  return static_cast<int64_t>(
+      compute_type_meta_hash_bits(meta_bytes, meta_size, header_low_bits) >>
+      TYPE_META_HASH_SHIFT);
+}
+
+inline Result<void, Error> validate_type_meta_header(uint64_t header) {
+  if (FORY_PREDICT_FALSE((header & TYPE_META_RESERVED_BITS_MASK) != 0)) {
+    return Unexpected(
+        Error::invalid_data("TypeMeta reserved header bits must be zero"));
+  }
+  if (FORY_PREDICT_FALSE((header & COMPRESS_META_FLAG) != 0)) {
+    return Unexpected(
+        Error::invalid_data("Compressed TypeMeta is not supported"));
+  }
+  return Result<void, Error>();
+}
+
+inline Result<uint32_t, Error>
+read_type_meta_size(Buffer &buffer, uint64_t header, size_t *header_size) {
+  Error error;
+  uint64_t meta_size = header & META_SIZE_MASK;
+  if (meta_size == META_SIZE_MASK) {
+    uint32_t before = buffer.reader_index();
+    uint32_t extra = buffer.read_var_uint32(error);
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+    meta_size += extra;
+    uint32_t after = buffer.reader_index();
+    if (header_size != nullptr) {
+      *header_size += (after - before);
+    }
+  }
+  if (FORY_PREDICT_FALSE(
+          meta_size > static_cast<uint64_t>(std::numeric_limits<int>::max()))) {
+    return Unexpected(
+        Error::invalid_data("TypeMeta body size exceeds supported range"));
+  }
+  return static_cast<uint32_t>(meta_size);
+}
+
+inline Result<void, Error>
+check_type_meta_body_size(uint32_t meta_size, uint32_t max_type_meta_bytes) {
+  if (FORY_PREDICT_FALSE(meta_size > max_type_meta_bytes)) {
+    return Unexpected(Error::invalid_data(
+        "Type metadata body size " + std::to_string(meta_size) +
+        " exceeds max_type_meta_bytes " + std::to_string(max_type_meta_bytes) +
+        ". The data may be malicious. If the data is not malicious, please "
+        "increase max_type_meta_bytes."));
+  }
+  return Result<void, Error>();
+}
+
+inline Result<void, Error> check_type_meta_fields(size_t num_fields,
+                                                  uint32_t max_type_fields) {
+  if (FORY_PREDICT_FALSE(num_fields > max_type_fields)) {
+    return Unexpected(Error::invalid_data(
+        "Type metadata field count " + std::to_string(num_fields) +
+        " exceeds max_type_fields " + std::to_string(max_type_fields) +
+        ". The data may be malicious. If the data is not malicious, please "
+        "increase max_type_fields."));
+  }
+  return Result<void, Error>();
+}
+
+inline Result<void, Error> validate_type_meta_hash(Buffer &buffer,
+                                                   uint32_t body_start,
+                                                   uint32_t meta_size,
+                                                   uint64_t header) {
+  uint64_t body_end = static_cast<uint64_t>(body_start) + meta_size;
+  if (FORY_PREDICT_FALSE(body_end > buffer.reader_index() ||
+                         body_end > buffer.size())) {
+    return Unexpected(
+        Error::invalid_data("TypeMeta body range is not readable"));
+  }
+  uint64_t computed_hash_bits = compute_type_meta_hash_bits(
+      buffer.data() + body_start, static_cast<size_t>(meta_size),
+      header & ~TYPE_META_HASH_BITS_MASK);
+  if (FORY_PREDICT_FALSE((computed_hash_bits >> TYPE_META_HASH_SHIFT) !=
+                         (header >> TYPE_META_HASH_SHIFT))) {
+    return Unexpected(Error::invalid_data("TypeMeta metadata hash mismatch"));
+  }
+  return Result<void, Error>();
+}
+
+inline Result<std::string, Error>
+read_meta_name(Buffer &buffer, const MetaStringDecoder &decoder,
+               const MetaEncoding *encodings, size_t enc_count) {
+  Error error;
+  uint8_t header = buffer.read_uint8(error);
+  if (FORY_PREDICT_FALSE(!error.ok())) {
+    return Unexpected(std::move(error));
+  }
+  uint8_t encoding_idx = header & 0x3u;
+  uint8_t length_prefix = header >> 2;
+
+  if (encoding_idx >= enc_count) {
+    return Unexpected(
+        Error::encoding_error("Invalid meta string encoding index: " +
+                              std::to_string(static_cast<int>(encoding_idx))));
+  }
+
+  size_t length = length_prefix;
+  if (length >= BIG_NAME_THRESHOLD) {
+    uint32_t extra = buffer.read_var_uint32(error);
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+    length = BIG_NAME_THRESHOLD + static_cast<size_t>(extra);
+  }
+
+  if (FORY_PREDICT_FALSE(
+          length > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))) {
+    return Unexpected(
+        Error::invalid_data("Meta string size exceeds uint32 range"));
+  }
+  if (FORY_PREDICT_FALSE(
+          !buffer.ensure_readable(static_cast<uint32_t>(length), error))) {
+    return Unexpected(std::move(error));
+  }
+  std::vector<uint8_t> bytes(length);
+  if (length > 0) {
+    buffer.read_bytes(bytes.data(), static_cast<uint32_t>(length), error);
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+  }
+
+  MetaEncoding encoding = encodings[encoding_idx];
+  FORY_TRY(result, decoder.decode(bytes.data(), bytes.size(), encoding));
+  return result;
+}
+
+Result<std::unique_ptr<TypeMeta>, Error>
+parse_type_meta_body(Buffer &body, const TypeMeta *local_type_info,
+                     int64_t meta_hash, uint32_t max_type_fields) {
+  Error error;
+  const uint8_t meta_header = body.read_uint8(error);
+  if (FORY_PREDICT_FALSE(!error.ok())) {
+    return Unexpected(std::move(error));
+  }
+
+  uint32_t type_id = 0;
+  uint32_t user_type_id = kInvalidUserTypeId;
+  std::string namespace_str;
+  std::string type_name;
+  bool register_by_name = false;
+  size_t num_fields = 0;
+
+  if ((meta_header & STRUCT_TYPEDEF_FLAG) != 0) {
+    register_by_name = (meta_header & REGISTER_BY_NAME_FLAG) != 0;
+    const bool compatible = (meta_header & COMPATIBLE_TYPEDEF_FLAG) != 0;
+    if (register_by_name) {
+      type_id = static_cast<uint32_t>(
+          compatible ? TypeId::NAMED_COMPATIBLE_STRUCT : TypeId::NAMED_STRUCT);
+    } else {
+      type_id = static_cast<uint32_t>(compatible ? TypeId::COMPATIBLE_STRUCT
+                                                 : TypeId::STRUCT);
+    }
+    num_fields = meta_header & SMALL_NUM_FIELDS_THRESHOLD;
+    if (num_fields == SMALL_NUM_FIELDS_THRESHOLD) {
+      const uint32_t extra = body.read_var_uint32(error);
+      if (FORY_PREDICT_FALSE(!error.ok())) {
+        return Unexpected(std::move(error));
+      }
+      num_fields += extra;
+    }
+    FORY_RETURN_IF_ERROR(check_type_meta_fields(num_fields, max_type_fields));
+  } else {
+    if (FORY_PREDICT_FALSE((meta_header & NON_STRUCT_RESERVED_BITS_MASK) !=
+                           0)) {
+      return Unexpected(Error::invalid_data("Invalid TypeMeta kind header"));
+    }
+    FORY_TRY(decoded_type_id,
+             type_id_from_type_meta_kind(meta_header & 0b1111));
+    type_id = decoded_type_id;
+    register_by_name = is_namespaced_type(static_cast<TypeId>(type_id));
+  }
+
+  if (register_by_name) {
+    static const MetaStringDecoder k_namespace_decoder('.', '_');
+    static const MetaStringDecoder k_type_name_decoder('$', '_');
+
+    FORY_TRY(ns,
+             read_meta_name(body, k_namespace_decoder, k_namespace_encodings,
+                            sizeof(k_namespace_encodings) /
+                                sizeof(k_namespace_encodings[0])));
+    namespace_str = std::move(ns);
+
+    FORY_TRY(tn,
+             read_meta_name(body, k_type_name_decoder, k_type_name_encodings,
+                            sizeof(k_type_name_encodings) /
+                                sizeof(k_type_name_encodings[0])));
+    type_name = std::move(tn);
+  } else {
+    const uint32_t uid = body.read_var_uint32(error);
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+    user_type_id = uid;
+  }
+
+  if (FORY_PREDICT_FALSE(num_fields > body.remaining_size())) {
+    return Unexpected(
+        Error::invalid_data("TypeMeta field count exceeds remaining metadata"));
+  }
+  std::vector<FieldInfo> field_infos;
+  field_infos.reserve(num_fields);
+  std::unordered_set<int32_t> field_tags;
+  for (size_t i = 0; i < num_fields; ++i) {
+    FORY_TRY(field, FieldInfo::from_bytes(body));
+    if (local_type_info == nullptr && field.field_id >= 0) {
+      if (field_tags.empty()) {
+        field_tags.reserve(num_fields);
+      }
+      if (!field_tags.emplace(field.field_id).second) {
+        return Unexpected(Error::invalid_data("Duplicate field tag"));
+      }
+    }
+    field_infos.push_back(std::move(field));
+  }
+
+  // Remote fields are already in sender data order and must not be re-sorted.
+  if (local_type_info != nullptr) {
+    FORY_RETURN_IF_ERROR(
+        TypeMeta::assign_local_dispatch_ids(local_type_info, field_infos));
+  }
+  if (FORY_PREDICT_FALSE(body.remaining_size() != 0)) {
+    return Unexpected(Error::invalid_data(
+        "TypeMeta parser did not consume declared meta size"));
+  }
+
+  auto meta = std::make_unique<TypeMeta>();
+  meta->hash = meta_hash;
+  meta->type_id = type_id;
+  meta->user_type_id = user_type_id;
+  meta->namespace_str = std::move(namespace_str);
+  meta->type_name = std::move(type_name);
+  meta->register_by_name = register_by_name;
+  meta->field_infos = std::move(field_infos);
+  return meta;
+}
+
+} // namespace
+
+TypeMeta TypeMeta::from_fields(uint32_t tid, const std::string &ns,
+                               const std::string &name, bool by_name,
+                               uint32_t user_type_id,
+                               std::vector<FieldInfo> fields) {
+  for (const auto &field : fields) {
+    FORY_CHECK(!field.field_name.empty())
+        << "Type '" << name << "' contains a field with empty name";
+  }
+  TypeMeta meta;
+  meta.type_id = tid;
+  meta.user_type_id = user_type_id;
+  meta.namespace_str = ns;
+  meta.type_name = name;
+  meta.register_by_name = by_name;
+  meta.field_infos = std::move(fields);
+  meta.hash = 0; // Will be computed during serialization
+  return meta;
+}
+
+Result<std::vector<uint8_t>, Error> TypeMeta::to_bytes() const {
+  Buffer layer_buffer;
+
+  bool is_struct = is_struct_type(static_cast<TypeId>(type_id));
+  size_t num_fields = field_infos.size();
+  if (FORY_PREDICT_FALSE(!is_struct && num_fields != 0)) {
+    return Unexpected(
+        Error::invalid_data("Non-struct TypeMeta cannot carry field metadata"));
+  }
+  std::unordered_set<int32_t> field_tags;
+  for (const auto &field : field_infos) {
+    if (field.field_id >= 0) {
+      if (field_tags.empty()) {
+        field_tags.reserve(num_fields);
+      }
+      if (!field_tags.emplace(field.field_id).second) {
+        return Unexpected(Error::invalid("Duplicate field tag"));
+      }
+    }
+  }
+
+  if (is_struct) {
+    uint8_t meta_header =
+        STRUCT_TYPEDEF_FLAG |
+        static_cast<uint8_t>(std::min(num_fields, SMALL_NUM_FIELDS_THRESHOLD));
+    if (is_compatible_struct_type_id(type_id)) {
+      meta_header |= COMPATIBLE_TYPEDEF_FLAG;
+    }
+    if (register_by_name) {
+      meta_header |= REGISTER_BY_NAME_FLAG;
+    }
+    layer_buffer.write_uint8(meta_header);
+
+    if (num_fields >= SMALL_NUM_FIELDS_THRESHOLD) {
+      layer_buffer.write_var_uint32(num_fields - SMALL_NUM_FIELDS_THRESHOLD);
+    }
+  } else {
+    FORY_TRY(kind_code, type_meta_kind_code(type_id));
+    layer_buffer.write_uint8(kind_code);
+  }
+
+  if (register_by_name) {
+    FORY_RETURN_NOT_OK(write_meta_name(
+        layer_buffer, namespace_str, k_namespace_encoder,
+        k_namespace_encoding_list, k_namespace_encodings,
+        sizeof(k_namespace_encodings) / sizeof(k_namespace_encodings[0])));
+    FORY_RETURN_NOT_OK(write_meta_name(
+        layer_buffer, type_name, k_type_name_encoder, k_type_name_encoding_list,
+        k_type_name_encodings,
+        sizeof(k_type_name_encodings) / sizeof(k_type_name_encodings[0])));
+  } else {
+    if (user_type_id == kInvalidUserTypeId) {
+      return Unexpected(
+          Error::type_error("User type id is required for this type"));
+    }
+    layer_buffer.write_var_uint32(user_type_id);
+  }
+
+  // write field infos
+  for (const auto &field : field_infos) {
+    FORY_TRY(field_bytes, field.to_bytes());
+    layer_buffer.write_bytes(field_bytes.data(), field_bytes.size());
+  }
+
+  // Now write global binary header
+  Buffer result_buffer;
+  const uint32_t layer_size = layer_buffer.writer_index();
+  if (FORY_PREDICT_FALSE(layer_size > static_cast<uint32_t>(
+                                          std::numeric_limits<int>::max()))) {
+    return Unexpected(
+        Error::invalid_data("TypeMeta body size exceeds supported range"));
+  }
+  uint64_t meta_size = layer_size;
+  uint64_t header = std::min(META_SIZE_MASK, meta_size);
+
+  header |=
+      compute_type_meta_hash_bits(layer_buffer.data(), layer_size, header);
+
+  result_buffer.write_bytes(reinterpret_cast<const uint8_t *>(&header),
+                            sizeof(header));
+  if (meta_size >= META_SIZE_MASK) {
+    result_buffer.write_var_uint32(
+        static_cast<uint32_t>(meta_size - META_SIZE_MASK));
+  }
+  result_buffer.write_bytes(layer_buffer.data(), layer_size);
+  // Use actual bytes written to construct return vector
+  return std::vector<uint8_t>(result_buffer.data(),
+                              result_buffer.data() +
+                                  result_buffer.writer_index());
+}
+
+Result<std::unique_ptr<TypeMeta>, Error>
+TypeMeta::from_bytes(Buffer &buffer, const TypeMeta *local_type_info,
+                     uint32_t max_type_fields, uint32_t max_type_meta_bytes) {
+  Error error;
+  int64_t header;
+  buffer.read_bytes(&header, sizeof(header), error);
+  if (FORY_PREDICT_FALSE(!error.ok())) {
+    return Unexpected(std::move(error));
+  }
+
+  const uint64_t header_bits = static_cast<uint64_t>(header);
+  FORY_RETURN_IF_ERROR(validate_type_meta_header(header_bits));
+  FORY_TRY(meta_size, read_type_meta_size(buffer, header_bits, nullptr));
+  FORY_RETURN_IF_ERROR(
+      check_type_meta_body_size(meta_size, max_type_meta_bytes));
+  const int64_t meta_hash =
+      static_cast<int64_t>(header_bits >> TYPE_META_HASH_SHIFT);
+  const uint32_t body_start = buffer.reader_index();
+  // The size cap is not byte-availability proof. Ensure the declared body is
+  // readable before making a zero-copy view that cannot reach later root data.
+  if (FORY_PREDICT_FALSE(!buffer.ensure_readable(meta_size, error))) {
+    return Unexpected(std::move(error));
+  }
+  Buffer body(buffer.data() + body_start, meta_size, false);
+  auto meta_result =
+      parse_type_meta_body(body, local_type_info, meta_hash, max_type_fields);
+  if (FORY_PREDICT_FALSE(!meta_result.ok())) {
+    Error parse_error = std::move(meta_result).error();
+    if (parse_error.code() == ErrorCode::BufferOutOfBound) {
+      return Unexpected(
+          Error::invalid_data("TypeMeta parser exceeded declared meta size"));
+    }
+    return Unexpected(std::move(parse_error));
+  }
+  auto meta = std::move(meta_result).value();
+  FORY_RETURN_IF_ERROR(
+      validate_type_meta_hash(body, 0, meta_size, header_bits));
+  buffer.reader_index(body_start + meta_size);
+  return meta;
+}
+
+Result<std::unique_ptr<TypeMeta>, Error>
+TypeMeta::from_bytes_with_header(Buffer &buffer, int64_t header,
+                                 uint32_t max_type_fields,
+                                 uint32_t max_type_meta_bytes) {
+  const uint64_t header_bits = static_cast<uint64_t>(header);
+  FORY_RETURN_IF_ERROR(validate_type_meta_header(header_bits));
+  FORY_TRY(meta_size, read_type_meta_size(buffer, header_bits, nullptr));
+  FORY_RETURN_IF_ERROR(
+      check_type_meta_body_size(meta_size, max_type_meta_bytes));
+  const int64_t meta_hash =
+      static_cast<int64_t>(header_bits >> TYPE_META_HASH_SHIFT);
+
+  const uint32_t body_start = buffer.reader_index();
+  Error error;
+  // The size cap is not byte-availability proof. Ensure the declared body is
+  // readable before making a zero-copy view that cannot reach later root data.
+  if (FORY_PREDICT_FALSE(!buffer.ensure_readable(meta_size, error))) {
+    return Unexpected(std::move(error));
+  }
+
+  Buffer body(buffer.data() + body_start, meta_size, false);
+  auto meta_result =
+      parse_type_meta_body(body, nullptr, meta_hash, max_type_fields);
+  if (FORY_PREDICT_FALSE(!meta_result.ok())) {
+    Error parse_error = std::move(meta_result).error();
+    if (parse_error.code() == ErrorCode::BufferOutOfBound) {
+      return Unexpected(
+          Error::invalid_data("TypeMeta parser exceeded declared meta size"));
+    }
+    return Unexpected(std::move(parse_error));
+  }
+  auto meta = std::move(meta_result).value();
+  FORY_RETURN_IF_ERROR(
+      validate_type_meta_hash(body, 0, meta_size, header_bits));
+  buffer.reader_index(body_start + meta_size);
+  return meta;
+}
+
+// This helper runs on every compatible metadata-cache hit. Keep its entry on a
+// cache-line boundary so growth in unrelated cold metadata codecs cannot change
+// cache-hit throughput through link-layout drift.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((aligned(64)))
+#endif
+Result<void, Error>
+TypeMeta::skip_bytes_for_validated_header(Buffer &buffer, int64_t header) {
+  // Header-cache hits intentionally skip opaque metadata. This path must not
+  // allocate or materialize the body from the attacker-declared size.
+  Error error;
+  uint64_t meta_size = static_cast<uint64_t>(header) & META_SIZE_MASK;
+  if (meta_size == META_SIZE_MASK) {
+    uint32_t extra = buffer.read_var_uint32(error);
+    if (FORY_PREDICT_FALSE(!error.ok())) {
+      return Unexpected(std::move(error));
+    }
+    meta_size += extra;
+  }
+  if (FORY_PREDICT_FALSE(
+          meta_size >
+          static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))) {
+    return Unexpected(
+        Error::invalid_data("TypeMeta body size exceeds supported range"));
+  }
+  buffer.skip(static_cast<uint32_t>(meta_size), error);
+  if (FORY_PREDICT_FALSE(!error.ok())) {
+    return Unexpected(std::move(error));
+  }
+  return Result<void, Error>();
+}
+
+Result<void, Error>
+TypeMeta::check_struct_version(int32_t read_version, int32_t local_version,
+                               const std::string &type_name) {
+  if (read_version != local_version) {
+    return Unexpected(Error::type_error(
+        "Read class " + type_name + " version " + std::to_string(read_version) +
+        " is not consistent with " + std::to_string(local_version) +
+        ", please align struct field types and names, or keep compatible mode "
+        "enabled on every Fory peer"));
+  }
+  return {};
+}
+
+// ============================================================================
+// Field Sorting (following xlang spec and Rust implementation)
+// ============================================================================
+
+namespace {
+
+bool is_primitive_type(uint32_t type_id) {
+  return type_id >= static_cast<uint32_t>(TypeId::BOOL) &&
+         type_id <= static_cast<uint32_t>(TypeId::FLOAT64);
+}
+
+int32_t get_primitive_type_size(uint32_t type_id) {
+  switch (static_cast<TypeId>(type_id)) {
+  case TypeId::BOOL:
+  case TypeId::INT8:
+  case TypeId::UINT8:
+  case TypeId::FLOAT8:
+    return 1;
+  case TypeId::INT16:
+  case TypeId::UINT16:
+  case TypeId::FLOAT16:
+  case TypeId::BFLOAT16:
+    return 2;
+  case TypeId::INT32:
+  case TypeId::VARINT32:
+  case TypeId::UINT32:
+  case TypeId::VAR_UINT32:
+  case TypeId::FLOAT32:
+    return 4;
+  case TypeId::INT64:
+  case TypeId::VARINT64:
+  case TypeId::TAGGED_INT64:
+  case TypeId::UINT64:
+  case TypeId::VAR_UINT64:
+  case TypeId::TAGGED_UINT64:
+  case TypeId::FLOAT64:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+/// Check if a type ID represents a compressed (varint/tagged) type.
+/// This must match Java's Types.is_compressed_type() exactly for consistent
+/// field ordering. Java only considers VARINT32, VAR_UINT32, VARINT64,
+/// VAR_UINT64, TAGGED_INT64, and TAGGED_UINT64 as compressed.
+/// Note: INT32, INT64, UINT32, UINT64 are NOT compressed - they are fixed-size.
+bool is_compress(uint32_t type_id) {
+  return type_id == static_cast<uint32_t>(TypeId::VARINT32) ||
+         type_id == static_cast<uint32_t>(TypeId::VARINT64) ||
+         type_id == static_cast<uint32_t>(TypeId::TAGGED_INT64) ||
+         type_id == static_cast<uint32_t>(TypeId::VAR_UINT32) ||
+         type_id == static_cast<uint32_t>(TypeId::VAR_UINT64) ||
+         type_id == static_cast<uint32_t>(TypeId::TAGGED_UINT64);
+}
+
+std::string field_sort_key_text(const FieldInfo &field) {
+  if (field.field_id >= 0) {
+    return std::to_string(field.field_id);
+  }
+  return field.field_name;
+}
+
+int compare_field_sort_key(const FieldInfo &a, const FieldInfo &b) {
+  if (a.field_id >= 0 && b.field_id >= 0 && a.field_id != b.field_id) {
+    return a.field_id < b.field_id ? -1 : 1;
+  }
+  if (a.field_id >= 0 && b.field_id < 0) {
+    return -1;
+  }
+  if (a.field_id < 0 && b.field_id >= 0) {
+    return 1;
+  }
+  std::string a_key = field_sort_key_text(a);
+  std::string b_key = field_sort_key_text(b);
+  if (a_key != b_key) {
+    return a_key < b_key ? -1 : 1;
+  }
+  if (a.field_name != b.field_name) {
+    return a.field_name < b.field_name ? -1 : 1;
+  }
+  return 0;
+}
+
+// Numeric field sorter (for primitive fields)
+bool numeric_sorter(const FieldInfo &a, const FieldInfo &b) {
+  uint32_t a_id = a.field_type.type_id;
+  uint32_t b_id = b.field_type.type_id;
+  bool a_nullable = a.field_type.nullable;
+  bool b_nullable = b.field_type.nullable;
+  bool compress_a = is_compress(a_id);
+  bool compress_b = is_compress(b_id);
+  int32_t size_a = get_primitive_type_size(a_id);
+  int32_t size_b = get_primitive_type_size(b_id);
+
+  // Sort by: nullable (false first), compress (false first), size (larger
+  // first), type_id (ascending), field_name
+  if (a_nullable != b_nullable)
+    return !a_nullable; // non-nullable first
+  if (compress_a != compress_b)
+    return !compress_a; // fixed-size first
+  if (size_a != size_b)
+    return size_a > size_b; // larger size first
+  if (a_id != b_id)
+    return a_id < b_id; // type_id ascending
+  return compare_field_sort_key(a, b) < 0;
+}
+
+// Identity sorter (for non-primitive fields).
+// Sorts by numeric field ID when present, otherwise field name.
+bool name_sorter(const FieldInfo &a, const FieldInfo &b) {
+  return compare_field_sort_key(a, b) < 0;
+}
+
+uint32_t exact_schema_type_id(uint32_t type_id) {
+  switch (static_cast<TypeId>(type_id)) {
+  case TypeId::STRUCT:
+  case TypeId::COMPATIBLE_STRUCT:
+  case TypeId::NAMED_STRUCT:
+  case TypeId::NAMED_COMPATIBLE_STRUCT:
+  case TypeId::UNKNOWN:
+    return static_cast<uint32_t>(TypeId::STRUCT);
+  case TypeId::ENUM:
+  case TypeId::NAMED_ENUM:
+    return static_cast<uint32_t>(TypeId::ENUM);
+  case TypeId::EXT:
+  case TypeId::NAMED_EXT:
+    return static_cast<uint32_t>(TypeId::EXT);
+  case TypeId::UNION:
+  case TypeId::TYPED_UNION:
+  case TypeId::NAMED_UNION:
+    return static_cast<uint32_t>(TypeId::UNION);
+  default:
+    return type_id;
+  }
+}
+
+bool user_type_ids_compatible(const FieldType &local, const FieldType &remote) {
+  return local.user_type_id == remote.user_type_id ||
+         local.type_id == static_cast<uint32_t>(TypeId::UNKNOWN) ||
+         remote.type_id == static_cast<uint32_t>(TypeId::UNKNOWN);
+}
+
+bool byte_sequence_field_types_compatible(const FieldType &local,
+                                          const FieldType &remote) {
+  if (local.track_ref || remote.track_ref ||
+      local.nullable != remote.nullable) {
+    return false;
+  }
+  return (local.type_id == static_cast<uint32_t>(TypeId::BINARY) &&
+          remote.type_id == static_cast<uint32_t>(TypeId::UINT8_ARRAY)) ||
+         (local.type_id == static_cast<uint32_t>(TypeId::UINT8_ARRAY) &&
+          remote.type_id == static_cast<uint32_t>(TypeId::BINARY));
+}
+
+bool scalar_field_type_id(uint32_t type_id) {
+  return compatible_scalar_field_types(type_id, type_id);
+}
+
+bool compatible_payload_field_types(const FieldType &local,
+                                    const FieldType &remote) {
+  if (scalar_field_type_id(local.type_id) ||
+      scalar_field_type_id(remote.type_id)) {
+    return !local.track_ref && !remote.track_ref &&
+           local.type_id == remote.type_id;
+  }
+  if (exact_schema_type_id(local.type_id) !=
+          exact_schema_type_id(remote.type_id) ||
+      !user_type_ids_compatible(local, remote) ||
+      local.generics.size() != remote.generics.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < local.generics.size(); ++i) {
+    if (!compatible_payload_field_types(local.generics[i],
+                                        remote.generics[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool direct_field_types_compatible(const FieldType &local,
+                                   const FieldType &remote) {
+  if (compatible_scalar_field_types(local.type_id, remote.type_id)) {
+    if (local.track_ref != remote.track_ref) {
+      return false;
+    }
+    if ((local.track_ref || remote.track_ref) &&
+        (local.type_id != remote.type_id ||
+         local.nullable != remote.nullable)) {
+      return false;
+    }
+    if (!local.track_ref && (local.type_id != remote.type_id ||
+                             local.nullable != remote.nullable)) {
+      return false;
+    }
+  }
+
+  if (field_types_compatible(local, remote)) {
+    return true;
+  }
+
+  uint32_t array_element_type_id = 0;
+  if (local.type_id == static_cast<uint32_t>(TypeId::LIST) &&
+      remote.generics.size() == 0 &&
+      primitive_array_element_type_id(remote.type_id, array_element_type_id) &&
+      local.generics.size() == 1 && !local.nullable && !local.track_ref &&
+      !remote.nullable && !remote.track_ref) {
+    return compatible_fingerprint_type_id(local.generics[0].type_id) ==
+           compatible_fingerprint_type_id(array_element_type_id);
+  }
+  if (remote.type_id == static_cast<uint32_t>(TypeId::LIST) &&
+      local.generics.size() == 0 &&
+      primitive_array_element_type_id(local.type_id, array_element_type_id) &&
+      remote.generics.size() == 1 && !local.nullable && !local.track_ref &&
+      !remote.nullable && !remote.track_ref && !remote.generics[0].track_ref) {
+    // Nullable element schema is compatible with dense arrays when the payload
+    // has no nulls; actual null elements are rejected by the array reader.
+    // Ref-tracked element framing stays rejected because this path is
+    // primitive-only.
+    return compatible_fingerprint_type_id(remote.generics[0].type_id) ==
+           compatible_fingerprint_type_id(array_element_type_id);
+  }
+  return false;
+}
+
+} // anonymous namespace
+
+uint32_t compatible_fingerprint_type_id(uint32_t type_id) {
+  switch (static_cast<TypeId>(type_id)) {
+  case TypeId::STRUCT:
+  case TypeId::COMPATIBLE_STRUCT:
+  case TypeId::NAMED_STRUCT:
+  case TypeId::NAMED_COMPATIBLE_STRUCT:
+  case TypeId::UNKNOWN:
+    return static_cast<uint32_t>(TypeId::STRUCT);
+  case TypeId::ENUM:
+  case TypeId::NAMED_ENUM:
+    return static_cast<uint32_t>(TypeId::ENUM);
+  case TypeId::EXT:
+  case TypeId::NAMED_EXT:
+    return static_cast<uint32_t>(TypeId::EXT);
+  case TypeId::BINARY:
+  case TypeId::INT8_ARRAY:
+  case TypeId::UINT8_ARRAY:
+    return static_cast<uint32_t>(TypeId::BINARY);
+  case TypeId::INT32:
+  case TypeId::VARINT32:
+    return static_cast<uint32_t>(TypeId::VARINT32);
+  case TypeId::INT64:
+  case TypeId::VARINT64:
+  case TypeId::TAGGED_INT64:
+    return static_cast<uint32_t>(TypeId::VARINT64);
+  case TypeId::UINT32:
+  case TypeId::VAR_UINT32:
+    return static_cast<uint32_t>(TypeId::VAR_UINT32);
+  case TypeId::UINT64:
+  case TypeId::VAR_UINT64:
+  case TypeId::TAGGED_UINT64:
+    return static_cast<uint32_t>(TypeId::VAR_UINT64);
+  default:
+    return type_id;
+  }
+}
+
+bool field_types_compatible(const FieldType &local, const FieldType &remote) {
+  if (exact_schema_type_id(local.type_id) !=
+          exact_schema_type_id(remote.type_id) ||
+      !user_type_ids_compatible(local, remote) ||
+      local.nullable != remote.nullable ||
+      local.track_ref != remote.track_ref) {
+    return false;
+  }
+  if (local.generics.size() != remote.generics.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < local.generics.size(); ++i) {
+    if (!field_types_compatible(local.generics[i], remote.generics[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool primitive_array_element_type_id(uint32_t array_type_id,
+                                     uint32_t &element_type_id) {
+  switch (static_cast<TypeId>(array_type_id)) {
+  case TypeId::BOOL_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::BOOL);
+    return true;
+  case TypeId::INT8_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::INT8);
+    return true;
+  case TypeId::INT16_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::INT16);
+    return true;
+  case TypeId::INT32_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::VARINT32);
+    return true;
+  case TypeId::INT64_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::VARINT64);
+    return true;
+  case TypeId::FLOAT16_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::FLOAT16);
+    return true;
+  case TypeId::FLOAT32_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::FLOAT32);
+    return true;
+  case TypeId::FLOAT64_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::FLOAT64);
+    return true;
+  case TypeId::UINT8_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::UINT8);
+    return true;
+  case TypeId::UINT16_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::UINT16);
+    return true;
+  case TypeId::UINT32_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::UINT32);
+    return true;
+  case TypeId::UINT64_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::UINT64);
+    return true;
+  case TypeId::BFLOAT16_ARRAY:
+    element_type_id = static_cast<uint32_t>(TypeId::BFLOAT16);
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool field_types_compatible_top_level(const FieldType &local,
+                                      const FieldType &remote) {
+  return direct_field_types_compatible(local, remote) ||
+         byte_sequence_field_types_compatible(local, remote) ||
+         (!local.track_ref && !remote.track_ref &&
+          compatible_scalar_field_types(local.type_id, remote.type_id)) ||
+         compatible_payload_field_types(local, remote);
+}
+
+std::vector<FieldInfo>
+TypeMeta::sort_field_infos(std::vector<FieldInfo> fields) {
+  // Group fields according to xlang spec. Non-primitives intentionally share
+  // one identifier-sorted tail group regardless of type ID.
+  std::vector<FieldInfo> primitive_fields;
+  std::vector<FieldInfo> nullable_primitive_fields;
+  std::vector<FieldInfo> non_primitive_fields;
+
+  for (auto &field : fields) {
+    uint32_t type_id = field.field_type.type_id;
+    bool nullable = field.field_type.nullable;
+
+    if (is_primitive_type(type_id)) {
+      if (nullable) {
+        nullable_primitive_fields.push_back(std::move(field));
+      } else {
+        primitive_fields.push_back(std::move(field));
+      }
+    } else {
+      non_primitive_fields.push_back(std::move(field));
+    }
+  }
+
+  // Sort each group
+  std::sort(primitive_fields.begin(), primitive_fields.end(), numeric_sorter);
+  std::sort(nullable_primitive_fields.begin(), nullable_primitive_fields.end(),
+            numeric_sorter);
+  std::sort(non_primitive_fields.begin(), non_primitive_fields.end(),
+            name_sorter);
+
+  // Combine sorted groups
+  std::vector<FieldInfo> sorted;
+  sorted.reserve(fields.size());
+  sorted.insert(sorted.end(), std::make_move_iterator(primitive_fields.begin()),
+                std::make_move_iterator(primitive_fields.end()));
+  sorted.insert(sorted.end(),
+                std::make_move_iterator(nullable_primitive_fields.begin()),
+                std::make_move_iterator(nullable_primitive_fields.end()));
+  sorted.insert(sorted.end(),
+                std::make_move_iterator(non_primitive_fields.begin()),
+                std::make_move_iterator(non_primitive_fields.end()));
+
+  return sorted;
+}
+
+// ============================================================================
+// Field ID Assignment (KEY FUNCTION for schema evolution!)
+// ============================================================================
+
+Result<void, Error>
+TypeMeta::assign_local_dispatch_ids(const TypeMeta *local_type,
+                                    std::vector<FieldInfo> &remote_fields) {
+  if (FORY_PREDICT_FALSE(local_type == nullptr)) {
+    return Unexpected(Error::invalid("Local TypeMeta is required"));
+  }
+  const auto &local_fields = local_type->field_infos;
+  constexpr size_t max_compatible_matched_field_index =
+      (static_cast<size_t>(std::numeric_limits<int16_t>::max()) - 1) / 2;
+  const auto invalid_wire_id = [](int32_t field_id) {
+    return field_id < detail::kFieldNameIdentity ||
+           field_id > detail::kMaxFieldTag;
+  };
+  if (FORY_PREDICT_FALSE(std::any_of(local_fields.begin(), local_fields.end(),
+                                     [&](const FieldInfo &field) {
+                                       return invalid_wire_id(field.field_id);
+                                     }) ||
+                         std::any_of(remote_fields.begin(), remote_fields.end(),
+                                     [&](const FieldInfo &field) {
+                                       return invalid_wire_id(field.field_id);
+                                     }))) {
+    return Unexpected(
+        Error::invalid("Field tag exceeds the wire TAG_ID range"));
+  }
+
+  // Primary mapping: field name -> sorted index in local schema
+  std::unordered_map<std::string, size_t> local_field_index_map;
+  local_field_index_map.reserve(local_fields.size());
+  for (size_t i = 0; i < local_fields.size(); ++i) {
+    local_field_index_map.emplace(local_fields[i].field_name, i);
+  }
+  // Tag ID mapping when field IDs are explicitly configured.
+  std::unordered_map<int32_t, size_t> local_field_id_map;
+  local_field_id_map.reserve(local_fields.size());
+  for (size_t i = 0; i < local_fields.size(); ++i) {
+    if (local_fields[i].field_id >= 0 &&
+        !local_field_id_map.emplace(local_fields[i].field_id, i).second) {
+      return Unexpected(Error::invalid("Duplicate local field tag"));
+    }
+  }
+  std::unordered_set<int32_t> remote_field_ids;
+  for (const auto &remote_field : remote_fields) {
+    if (remote_field.field_id >= 0) {
+      if (remote_field_ids.empty()) {
+        remote_field_ids.reserve(remote_fields.size());
+      }
+      if (!remote_field_ids.emplace(remote_field.field_id).second) {
+        return Unexpected(Error::invalid_data("Duplicate remote field tag"));
+      }
+    }
+  }
+  // Track which local fields have already been matched so that each
+  // local field is bound to at most one remote field when we fall
+  // back to type-based matching.
+  std::vector<bool> used(local_fields.size(), false);
+
+  auto assign_matched_field = [&](FieldInfo &remote_field,
+                                  size_t local_index) -> Result<bool, Error> {
+    if (used[local_index]) {
+      return false;
+    }
+    const FieldInfo &local_field = local_fields[local_index];
+    if (field_types_compatible(local_field.field_type,
+                               remote_field.field_type)) {
+      if (local_index > max_compatible_matched_field_index) {
+        return Unexpected(Error::type_error(
+            "Cannot assign compatible matched id for local field " +
+            local_field.field_name + ": local field index " +
+            std::to_string(local_index) + " exceeds max " +
+            std::to_string(max_compatible_matched_field_index)));
+      }
+      remote_field.matched_field_id = static_cast<int16_t>(local_index * 2);
+      used[local_index] = true;
+      return true;
+    }
+    if (field_types_compatible_top_level(local_field.field_type,
+                                         remote_field.field_type)) {
+      if (local_index > max_compatible_matched_field_index) {
+        return Unexpected(Error::type_error(
+            "Cannot assign compatible matched id for local field " +
+            local_field.field_name + ": local field index " +
+            std::to_string(local_index) + " exceeds max " +
+            std::to_string(max_compatible_matched_field_index)));
+      }
+      remote_field.matched_field_id = static_cast<int16_t>(local_index * 2 + 1);
+      used[local_index] = true;
+      return true;
+    }
+    return Unexpected(Error::type_error(
+        "Cannot read remote field " + remote_field.field_name +
+        " as local field " + local_field.field_name +
+        ": remote and local field schemas are not compatible"));
+  };
+
+  // For each remote field, assign doubled dispatch id in local schema.
+  for (auto &remote_field : remote_fields) {
+    bool matched = false;
+
+    if (remote_field.field_id >= 0) {
+      auto id_it = local_field_id_map.find(remote_field.field_id);
+      if (id_it != local_field_id_map.end()) {
+        FORY_TRY(is_matched, assign_matched_field(remote_field, id_it->second));
+        matched = is_matched;
+      }
+    } else {
+      // 1) Try exact name + type match first (fast path for same-language
+      //    schemas and most C++-only cases). A local tag-ID field's identifier
+      //    is the tag ID, not the field name, so it must not match an untagged
+      //    remote field by name in a mixed schema.
+      auto it = local_field_index_map.find(remote_field.field_name);
+      if (it != local_field_index_map.end()) {
+        size_t idx = it->second;
+        const FieldInfo &local_field = local_fields[idx];
+        if (local_field.field_id < 0) {
+          FORY_TRY(is_matched, assign_matched_field(remote_field, idx));
+          matched = is_matched;
+        }
+      }
+
+      // 2) Fallback by type signature only when no canonical remote name was
+      //    carried. Named remote fields that miss the local name map are
+      //    remote-only fields; matching them by type can bind an added string
+      //    field such as `email` to an unrelated local string field.
+      if (!matched && remote_field.field_name.empty()) {
+        for (size_t i = 0; i < local_fields.size(); ++i) {
+          if (used[i] || local_fields[i].field_id >= 0) {
+            continue;
+          }
+          // Compatible adapters require tag or canonical-name identity. The
+          // type-only fallback is only for anonymous legacy fields with exact
+          // schema shape, otherwise unrelated fields can bind by value type.
+          if (field_types_compatible(local_fields[i].field_type,
+                                     remote_field.field_type)) {
+            FORY_TRY(is_matched, assign_matched_field(remote_field, i));
+            matched = is_matched;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!matched) {
+      // No suitable local field found -> mark as skipped.
+      remote_field.matched_field_id = -1;
+    }
+  }
+  return Result<void, Error>();
+}
+
+int64_t TypeMeta::compute_hash(const std::vector<uint8_t> &meta_bytes) {
+  return compute_type_meta_hash(meta_bytes.data(), meta_bytes.size());
+}
+
+namespace {
+
+std::string to_snake_case(const std::string &name) {
+  bool all_lower = true;
+  for (char c : name) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    if (!(static_cast<bool>(std::islower(uc)) ||
+          static_cast<bool>(std::isdigit(uc)) || c == '_')) {
+      all_lower = false;
+      break;
+    }
+  }
+  if (all_lower) {
+    return name;
+  }
+
+  std::string result;
+  result.reserve(name.size() * 2);
+  std::optional<char> prev;
+
+  for (size_t i = 0; i < name.size(); ++i) {
+    char ch = name[i];
+    if (ch == '_') {
+      result.push_back('_');
+      prev = ch;
+      continue;
+    }
+
+    if (static_cast<bool>(std::isupper(static_cast<unsigned char>(ch)))) {
+      bool need_underscore = false;
+      if (prev.has_value()) {
+        char prev_ch = *prev;
+        bool prev_lower_or_digit = static_cast<bool>(
+            std::islower(static_cast<unsigned char>(prev_ch)) ||
+            std::isdigit(static_cast<unsigned char>(prev_ch)));
+        bool prev_upper = static_cast<bool>(
+            std::isupper(static_cast<unsigned char>(prev_ch)));
+
+        bool next_is_lower = false;
+        if (i + 1 < name.size()) {
+          char next = name[i + 1];
+          next_is_lower =
+              static_cast<bool>(std::islower(static_cast<unsigned char>(next)));
+        }
+
+        if (prev_lower_or_digit || (prev_upper && next_is_lower)) {
+          need_underscore = true;
+        }
+      }
+      if (need_underscore && !result.empty() && result.back() != '_') {
+        result.push_back('_');
+      }
+      result.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    } else {
+      result.push_back(ch);
+    }
+    prev = ch;
+  }
+
+  return result;
+}
+
+std::string normalize_field_name(const std::string &name) {
+  std::string normalized = to_snake_case(name);
+  while (!normalized.empty() && normalized.back() == '_') {
+    normalized.pop_back();
+  }
+  return normalized;
+}
+
+} // anonymous namespace
+
+std::string TypeMeta::compute_struct_fingerprint(
+    const std::vector<FieldInfo> &field_infos) {
+  // Computes the fingerprint string for a struct type used in schema
+  // versioning.
+  //
+  // Fingerprint Format:
+  //   Each field contributes: <field_id_or_name>,<type_id>,<ref>,<nullable>;
+  //   Tagged fields are sorted by numeric tag ID; untagged fields are sorted
+  //   lexicographically by snake_case field name.
+  //
+  // Field Components:
+  //   - field_id_or_name: tag ID as string if configured, otherwise snake_case
+  //   field name
+  //   - field_type_fingerprint:
+  //     <type_id>,<ref>,<nullable>[<nested_type_fingerprint>]
+  //
+  // Example fingerprints:
+  //   - With tag IDs: "0,4,0,0;1,12,0,1;"
+  //   - With field names: "age,4,0,0;name,12,0,1;"
+
+  // Copy fields and sort by canonical field identifier for fingerprint.
+  std::vector<FieldInfo> sorted_fields = field_infos;
+  std::sort(
+      sorted_fields.begin(), sorted_fields.end(),
+      [](const FieldInfo &a, const FieldInfo &b) {
+        if (a.field_id >= 0 && b.field_id >= 0 && a.field_id != b.field_id) {
+          return a.field_id < b.field_id;
+        }
+        std::string a_id = a.field_id >= 0 ? std::to_string(a.field_id)
+                                           : normalize_field_name(a.field_name);
+        std::string b_id = b.field_id >= 0 ? std::to_string(b.field_id)
+                                           : normalize_field_name(b.field_name);
+        if (a_id != b_id) {
+          return a_id < b_id;
+        }
+        return a.field_name < b.field_name;
+      });
+
+  std::string fingerprint;
+  // reserve a rough estimate to avoid reallocations
+  fingerprint.reserve(sorted_fields.size() * 24);
+
+  auto fingerprint_type_id = [](uint32_t type_id) -> uint32_t {
+    if (type_id == static_cast<uint32_t>(TypeId::ENUM) ||
+        type_id == static_cast<uint32_t>(TypeId::NAMED_ENUM) ||
+        type_id == static_cast<uint32_t>(TypeId::STRUCT) ||
+        type_id == static_cast<uint32_t>(TypeId::COMPATIBLE_STRUCT) ||
+        type_id == static_cast<uint32_t>(TypeId::NAMED_STRUCT) ||
+        type_id == static_cast<uint32_t>(TypeId::NAMED_COMPATIBLE_STRUCT) ||
+        type_id == static_cast<uint32_t>(TypeId::EXT) ||
+        type_id == static_cast<uint32_t>(TypeId::NAMED_EXT) ||
+        type_id == static_cast<uint32_t>(TypeId::UNION) ||
+        type_id == static_cast<uint32_t>(TypeId::TYPED_UNION) ||
+        type_id == static_cast<uint32_t>(TypeId::NAMED_UNION)) {
+      return static_cast<uint32_t>(TypeId::UNKNOWN);
+    }
+    return type_id;
+  };
+  std::function<void(std::string &, const FieldType &, bool, bool)>
+      append_field_type = [&](std::string &out, const FieldType &field_type,
+                              bool include_ref, bool include_nullable) {
+        out.append(std::to_string(fingerprint_type_id(field_type.type_id)));
+        out.push_back(',');
+        out.push_back(include_ref && field_type.track_ref ? '1' : '0');
+        out.push_back(',');
+        out.push_back(include_nullable && field_type.nullable ? '1' : '0');
+        if (field_type.type_id == static_cast<uint32_t>(TypeId::LIST) ||
+            field_type.type_id == static_cast<uint32_t>(TypeId::SET)) {
+          out.push_back('[');
+          if (!field_type.generics.empty()) {
+            append_field_type(out, field_type.generics.front(), false, false);
+          }
+          out.push_back(']');
+        } else if (field_type.type_id == static_cast<uint32_t>(TypeId::MAP)) {
+          out.push_back('[');
+          if (!field_type.generics.empty()) {
+            append_field_type(out, field_type.generics.front(), false, false);
+          }
+          out.push_back('|');
+          if (field_type.generics.size() > 1) {
+            append_field_type(out, field_type.generics[1], false, false);
+          }
+          out.push_back(']');
+        }
+      };
+
+  for (const auto &fi : sorted_fields) {
+    std::string field_id_or_name = fi.field_id >= 0
+                                       ? std::to_string(fi.field_id)
+                                       : normalize_field_name(fi.field_name);
+    fingerprint.append(field_id_or_name);
+    fingerprint.push_back(',');
+    append_field_type(fingerprint, fi.field_type, true, true);
+    fingerprint.push_back(';');
+  }
+
+  return fingerprint;
+}
+
+int32_t TypeMeta::compute_struct_version(const TypeMeta &meta) {
+  std::string fingerprint = compute_struct_fingerprint(meta.field_infos);
+
+  int64_t hash_out[2] = {0, 0};
+  MurmurHash3_x64_128(reinterpret_cast<const uint8_t *>(fingerprint.data()),
+                      static_cast<int>(fingerprint.size()), 47, hash_out);
+
+  // Use the low 64 bits and then keep low 32 bits as i32.
+  uint64_t low = static_cast<uint64_t>(hash_out[0]);
+  uint32_t version = static_cast<uint32_t>(low & 0xFFFF'FFFFu);
+#if defined(FORY_DEBUG) || defined(ENABLE_FORY_DEBUG_OUTPUT)
+  // DEBUG: Print fingerprint for debugging version mismatch
+  std::cerr << "[xlang][debug] struct_version type_name=" << meta.type_name
+            << ", fingerprint=\"" << fingerprint
+            << "\" version=" << static_cast<int32_t>(version) << std::endl;
+#endif
+  return static_cast<int32_t>(version);
+}
+
+// ============================================================================
+// TypeInfo::deep_clone Implementation
+// ============================================================================
+
+std::unique_ptr<TypeInfo> TypeInfo::deep_clone() const {
+  auto cloned = std::make_unique<TypeInfo>();
+  cloned->type_id = type_id;
+  cloned->user_type_id = user_type_id;
+  cloned->namespace_name = namespace_name;
+  cloned->type_name = type_name;
+  cloned->register_by_name = register_by_name;
+  cloned->is_external = is_external;
+  cloned->sorted_indices = sorted_indices;
+  cloned->name_to_index = name_to_index;
+  cloned->type_def = type_def;
+  cloned->harness = harness;
+
+  // Deep clone unique_ptr members
+  if (type_meta) {
+    cloned->type_meta = std::make_unique<TypeMeta>(*type_meta);
+  }
+  if (encoded_namespace) {
+    cloned->encoded_namespace = std::make_unique<CachedMetaString>();
+    cloned->encoded_namespace->original = encoded_namespace->original;
+    cloned->encoded_namespace->bytes = encoded_namespace->bytes;
+    cloned->encoded_namespace->encoding = encoded_namespace->encoding;
+    cloned->encoded_namespace->hash = encoded_namespace->hash;
+  }
+  if (encoded_type_name) {
+    cloned->encoded_type_name = std::make_unique<CachedMetaString>();
+    cloned->encoded_type_name->original = encoded_type_name->original;
+    cloned->encoded_type_name->bytes = encoded_type_name->bytes;
+    cloned->encoded_type_name->encoding = encoded_type_name->encoding;
+    cloned->encoded_type_name->hash = encoded_type_name->hash;
+  }
+
+  return cloned;
+}
+
+// ============================================================================
+// encode_meta_string Implementation
+// ============================================================================
+
+Result<std::unique_ptr<CachedMetaString>, Error>
+encode_meta_string(const std::string &value, bool is_namespace) {
+  auto cached = std::make_unique<CachedMetaString>();
+  cached->original = value;
+
+  if (value.empty()) {
+    // For empty strings, use a minimal encoding
+    cached->encoding = 0; // UTF8
+    cached->bytes.clear();
+    cached->hash = 0;
+    return cached;
+  }
+
+  // Use MetaStringEncoder to encode the string
+  static const MetaStringEncoder k_namespace_encoder('.', '_');
+  static const MetaStringEncoder k_type_name_encoder('$', '_');
+
+  static const std::vector<MetaEncoding> k_namespace_encodings = {
+      MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+      MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL};
+
+  static const std::vector<MetaEncoding> k_type_name_encodings = {
+      MetaEncoding::UTF8, MetaEncoding::ALL_TO_LOWER_SPECIAL,
+      MetaEncoding::LOWER_UPPER_DIGIT_SPECIAL,
+      MetaEncoding::FIRST_TO_LOWER_SPECIAL};
+
+  if (is_namespace) {
+    FORY_TRY(result, k_namespace_encoder.encode(value, k_namespace_encodings));
+    cached->encoding = static_cast<uint8_t>(result.encoding);
+    cached->bytes = std::move(result.bytes);
+  } else {
+    FORY_TRY(result, k_type_name_encoder.encode(value, k_type_name_encodings));
+    cached->encoding = static_cast<uint8_t>(result.encoding);
+    cached->bytes = std::move(result.bytes);
+  }
+
+  if (cached->bytes.size() > 16) {
+    cached->hash = compute_meta_string_hash(
+        cached->bytes, static_cast<MetaEncoding>(cached->encoding));
+  }
+
+  return cached;
+}
+
+Result<const TypeInfo *, Error>
+TypeResolver::get_type_info(const std::type_index &type_index) const {
+  // For runtime polymorphic lookups (e.g., smart pointers with dynamic types)
+  auto *entry = type_info_by_runtime_type_.find(type_index);
+  if (entry == nullptr) {
+    return Unexpected(Error::type_error("TypeInfo not found for type_index"));
+  }
+  return entry->second;
+}
+
+Result<std::unique_ptr<TypeResolver>, Error>
+TypeResolver::build_final_type_resolver() {
+  auto final_resolver = std::make_unique<TypeResolver>();
+
+  // copy configuration
+  final_resolver->compatible_ = compatible_;
+  final_resolver->xlang_ = xlang_;
+  final_resolver->check_struct_version_ = check_struct_version_;
+  final_resolver->track_ref_ = track_ref_;
+  final_resolver->finalized_ = true;
+
+  // Build mapping from old pointers to new pointers for rebuilding lookup maps
+  fory::flat_hash_map<const TypeInfo *, TypeInfo *> ptr_map;
+
+  // Deep clone all existing TypeInfo objects
+  for (const auto &info : type_infos_) {
+    auto cloned = info->deep_clone();
+    TypeInfo *new_ptr = cloned.get();
+    ptr_map[info.get()] = new_ptr;
+    final_resolver->type_infos_.push_back(std::move(cloned));
+  }
+  auto remap_type_info = [&ptr_map](const TypeInfo *old_ptr) {
+    auto *entry = ptr_map.find(old_ptr);
+    FORY_CHECK(entry != nullptr);
+    return entry->second;
+  };
+
+  // Rebuild lookup maps with new pointers
+  for (const auto &[key, old_ptr] : type_info_by_ctid_) {
+    final_resolver->type_info_by_ctid_.put(key, remap_type_info(old_ptr));
+  }
+  for (const auto &[key, old_ptr] : type_info_by_id_) {
+    final_resolver->type_info_by_id_.put(key, remap_type_info(old_ptr));
+  }
+  for (const auto &[key, old_ptr] : user_type_info_by_id_) {
+    final_resolver->user_type_info_by_id_.put(key, remap_type_info(old_ptr));
+  }
+  for (const auto &[key, old_ptr] : type_info_by_name_) {
+    final_resolver->type_info_by_name_[key] = remap_type_info(old_ptr);
+  }
+  for (const auto &[key, old_ptr] : type_info_by_runtime_type_) {
+    final_resolver->type_info_by_runtime_type_[key] = remap_type_info(old_ptr);
+  }
+
+  for (const auto &[key, old_ptr] : partial_type_infos_) {
+    final_resolver->partial_type_infos_.put(key, remap_type_info(old_ptr));
+  }
+
+  // Process all partial type infos to build complete type metadata
+  for (const auto &[rust_type_id, partial_ptr] :
+       final_resolver->partial_type_infos_) {
+    // Call the harness's sorted_field_infos function to get complete field info
+    FORY_TRY(sorted_fields,
+             partial_ptr->harness.sorted_field_infos_fn(*final_resolver));
+
+    // Build complete TypeMeta
+    TypeMeta meta = TypeMeta::from_fields(
+        partial_ptr->type_id, partial_ptr->namespace_name,
+        partial_ptr->type_name, partial_ptr->register_by_name,
+        partial_ptr->user_type_id, std::move(sorted_fields));
+
+    // Serialize TypeMeta to bytes
+    FORY_TRY(type_def, meta.to_bytes());
+
+    // Update the TypeInfo in place
+    partial_ptr->type_def = std::move(type_def);
+
+    // Parse the serialized TypeMeta back to create unique_ptr<TypeMeta>
+    Buffer buffer(partial_ptr->type_def.data(),
+                  static_cast<uint32_t>(partial_ptr->type_def.size()), false);
+    buffer.writer_index(static_cast<uint32_t>(partial_ptr->type_def.size()));
+    // This metadata was just generated from local registration state. Remote
+    // receive limits are enforced only on remote metadata parse/cache-miss
+    // paths, so large trusted local schemas do not fail during finalization.
+    FORY_TRY(parsed_meta,
+             TypeMeta::from_bytes(buffer, nullptr,
+                                  std::numeric_limits<uint32_t>::max(),
+                                  std::numeric_limits<uint32_t>::max()));
+    partial_ptr->type_meta = std::move(parsed_meta);
+  }
+
+  // Clear partial_type_infos in the final resolver since they're all completed
+  final_resolver->partial_type_infos_.clear();
+
+  return final_resolver;
+}
+
+std::unique_ptr<TypeResolver> TypeResolver::clone() const {
+  auto cloned = std::make_unique<TypeResolver>();
+
+  // copy configuration
+  cloned->compatible_ = compatible_;
+  cloned->xlang_ = xlang_;
+  cloned->check_struct_version_ = check_struct_version_;
+  cloned->track_ref_ = track_ref_;
+  cloned->finalized_ = finalized_;
+
+  // Build mapping from old pointers to new pointers
+  fory::flat_hash_map<const TypeInfo *, TypeInfo *> ptr_map;
+
+  // Deep clone all TypeInfo objects
+  for (const auto &info : type_infos_) {
+    auto cloned_info = info->deep_clone();
+    TypeInfo *new_ptr = cloned_info.get();
+    ptr_map[info.get()] = new_ptr;
+    cloned->type_infos_.push_back(std::move(cloned_info));
+  }
+  auto remap_type_info = [&ptr_map](const TypeInfo *old_ptr) {
+    auto *entry = ptr_map.find(old_ptr);
+    FORY_CHECK(entry != nullptr);
+    return entry->second;
+  };
+
+  // Rebuild lookup maps with new pointers
+  for (const auto &[key, old_ptr] : type_info_by_ctid_) {
+    cloned->type_info_by_ctid_.put(key, remap_type_info(old_ptr));
+  }
+  for (const auto &[key, old_ptr] : type_info_by_id_) {
+    cloned->type_info_by_id_.put(key, remap_type_info(old_ptr));
+  }
+  for (const auto &[key, old_ptr] : user_type_info_by_id_) {
+    cloned->user_type_info_by_id_.put(key, remap_type_info(old_ptr));
+  }
+  for (const auto &[key, old_ptr] : type_info_by_name_) {
+    cloned->type_info_by_name_[key] = remap_type_info(old_ptr);
+  }
+  for (const auto &[key, old_ptr] : type_info_by_runtime_type_) {
+    cloned->type_info_by_runtime_type_[key] = remap_type_info(old_ptr);
+  }
+  // Note: Don't copy partial_type_infos_ - clone should only be used on
+  // finalized resolvers
+
+  return cloned;
+}
+
+void TypeResolver::register_builtin_types() {
+  static_assert(sizeof(TypeId) == sizeof(uint8_t),
+                "TypeId must remain byte-sized for internal type ids");
+  // Register internal type IDs without harnesses (deserialization is static)
+  // These are needed so read_any_type_info can find them by type_id
+  auto register_type_id_only = [this](TypeId type_id) {
+    auto info = std::make_unique<TypeInfo>();
+    info->type_id = static_cast<uint32_t>(type_id);
+    info->register_by_name = false;
+    info->is_external = false;
+    TypeInfo *raw_ptr = info.get();
+    type_infos_.push_back(std::move(info));
+    type_info_by_id_.put(raw_ptr->type_id, raw_ptr);
+  };
+
+  // Primitive types
+  register_type_id_only(TypeId::BOOL);
+  register_type_id_only(TypeId::INT8);
+  register_type_id_only(TypeId::INT16);
+  register_type_id_only(TypeId::INT32);
+  register_type_id_only(TypeId::VARINT32);
+  register_type_id_only(TypeId::INT64);
+  register_type_id_only(TypeId::VARINT64);
+  register_type_id_only(TypeId::TAGGED_INT64);
+  register_type_id_only(TypeId::UINT8);
+  register_type_id_only(TypeId::UINT16);
+  register_type_id_only(TypeId::UINT32);
+  register_type_id_only(TypeId::VAR_UINT32);
+  register_type_id_only(TypeId::UINT64);
+  register_type_id_only(TypeId::VAR_UINT64);
+  register_type_id_only(TypeId::TAGGED_UINT64);
+  register_type_id_only(TypeId::FLOAT8);
+  register_type_id_only(TypeId::FLOAT16);
+  register_type_id_only(TypeId::BFLOAT16);
+  register_type_id_only(TypeId::FLOAT32);
+  register_type_id_only(TypeId::FLOAT64);
+  register_type_id_only(TypeId::STRING);
+
+  // Primitive array types
+  register_type_id_only(TypeId::BOOL_ARRAY);
+  register_type_id_only(TypeId::INT8_ARRAY);
+  register_type_id_only(TypeId::INT16_ARRAY);
+  register_type_id_only(TypeId::INT32_ARRAY);
+  register_type_id_only(TypeId::INT64_ARRAY);
+  register_type_id_only(TypeId::UINT8_ARRAY);
+  register_type_id_only(TypeId::UINT16_ARRAY);
+  register_type_id_only(TypeId::UINT32_ARRAY);
+  register_type_id_only(TypeId::UINT64_ARRAY);
+  register_type_id_only(TypeId::FLOAT8_ARRAY);
+  register_type_id_only(TypeId::FLOAT16_ARRAY);
+  register_type_id_only(TypeId::BFLOAT16_ARRAY);
+  register_type_id_only(TypeId::FLOAT32_ARRAY);
+  register_type_id_only(TypeId::FLOAT64_ARRAY);
+  register_type_id_only(TypeId::BINARY);
+
+  // Collection types
+  register_type_id_only(TypeId::LIST);
+  register_type_id_only(TypeId::SET);
+  register_type_id_only(TypeId::MAP);
+
+  // User types (base IDs without registration prefix)
+  register_type_id_only(TypeId::STRUCT);
+  register_type_id_only(TypeId::ENUM);
+  register_type_id_only(TypeId::EXT);
+
+  // Other internal types
+  register_type_id_only(TypeId::UNION);
+  register_type_id_only(TypeId::NONE);
+  register_type_id_only(TypeId::DURATION);
+  register_type_id_only(TypeId::TIMESTAMP);
+  register_type_id_only(TypeId::DATE);
+  register_type_id_only(TypeId::DECIMAL);
+  register_type_id_only(TypeId::ARRAY);
+}
+
+} // namespace serialization
+} // namespace fory

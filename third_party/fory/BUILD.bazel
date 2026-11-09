@@ -1,0 +1,27 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+# Apache Fory C++ runtime, vendored from https://github.com/apache/fory
+# (tag v1.7.7, cpp/fory).  Tests and CMake files of the upstream tree are not
+# vendored.
+#
+# The headers are published with the `cpp/` prefix stripped, so generated code
+# can `#include "fory/serialization/fory.h"` exactly like the upstream build
+# does (`strip_include_prefix = "/cpp"` in the upstream BUILD files).
+cc_library(
+    name = "fory",
+    srcs = glob(["cpp/fory/**/*.cc"]),
+    hdrs = glob(["cpp/fory/**/*.h"]),
+    copts = select({
+        # `fory/util/macros.h` enables AVX2 intrinsics unconditionally on
+        # x86_64, so the translation units must be compiled with AVX2 enabled.
+        "@platforms//cpu:x86_64": ["-mavx2"],
+        "//conditions:default": [],
+    }),
+    strip_include_prefix = "/third_party/fory/cpp",
+    alwayslink = True,
+    linkstatic = True,
+)
