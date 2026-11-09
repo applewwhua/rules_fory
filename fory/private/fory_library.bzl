@@ -1,6 +1,7 @@
 """Implementation of `fory_library` (the counterpart of `proto_library`)."""
 
 load("//fory:providers.bzl", "ForyInfo")
+load("//fory/toolchains:foryc_toolchain.bzl", "foryc_tool_inputs")
 load(
     "//fory/private:common.bzl",
     "FDL_EXTENSION",
@@ -69,8 +70,7 @@ def _fory_library_impl(ctx):
         outputs = [descriptor],
         tools = [
             ctx.attr._foryc_tool[DefaultInfo].files_to_run,
-            toolchain.foryc,
-        ],
+        ] + foryc_tool_inputs(toolchain),
         mnemonic = "ForyCheck",
         progress_message = "Checking Fory schemas of %s" % ctx.label,
     )

@@ -129,24 +129,40 @@ Consequences:
 
 ## The `foryc` compiler
 
-Code generation calls the `foryc` binary shipped by the `fory-compiler` wheel
-(`pip install fory-compiler`).  The module extension in
+Code generation runs `foryc`, the CLI of the
+[`fory-compiler`](https://pypi.org/project/fory-compiler/) wheel.  By default
+rules_fory **downloads the pinned wheel** from PyPI and runs its `foryc` entry
+point through a `py_binary` launcher, so nothing has to be installed on the
+host:
+
+* `//fory/toolchains:foryc_pip_toolchain` – default toolchain, backed by
+  `@fory_pip//fory_compiler` (pinned in
+  `fory/toolchains/requirements_lock.txt`, currently `fory-compiler==1.7.7`).
+
+### Using a locally installed compiler
+
+An existing `foryc` installation can be used instead.  The module extension in
 `fory/toolchains/extensions.bzl` locates it in this order:
 
 1. `foryc.configure(foryc = "/path/to/foryc")` in `MODULE.bazel`
 2. `$FORYC` (`bazel build --repo_env=FORYC=/path/to/foryc`)
 3. `which foryc`
 
-The default toolchain is a thin launcher around the local installation.  For a
-hermetic build, define your own toolchain and register it before the default
-one:
+and `//fory/toolchains:local_foryc_toolchain` exposes it as a drop-in
+replacement, e.g. for offline builds:
+
+```sh
+bazel build --extra_toolchains=//fory/toolchains:local_foryc_toolchain //...
+```
+
+A custom compiler can also be pinned by declaring a toolchain of your own:
 
 ```python
 load("@rules_fory//fory/toolchains:foryc_toolchain.bzl", "foryc_toolchain")
 
 foryc_toolchain(
     name = "my_foryc_impl",
-    foryc = "@fory_pip//:foryc",
+    foryc = "@foryc//:foryc.sh",
 )
 
 toolchain(
@@ -154,6 +170,13 @@ toolchain(
     toolchain = ":my_foryc_impl",
     toolchain_type = "@rules_fory//fory/toolchains:foryc_toolchain_type",
 )
+```
+
+Module consumers register the default (`foryc_pip_toolchain`) or the local one
+in their own `MODULE.bazel`:
+
+```python
+register_toolchains("@rules_fory//fory/toolchains:foryc_pip_toolchain")
 ```
 
 ## Vendored runtimes

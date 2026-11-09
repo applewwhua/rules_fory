@@ -195,6 +195,20 @@ def rewrite(text: str, lang: str, mapping, annotations=None) -> str:
     raise ForycError(f"unsupported language {lang!r}")
 
 
+# `foryc` may itself be a Bazel-built `py_binary` (the `fory-compiler` wheel
+# runs through a launcher).  The runfiles environment of this wrapper must not
+# leak into it, otherwise its bootstrap resolves the wrapper's runfiles tree
+# instead of its own and the `fory_compiler` package is not importable.
+_LEAKY_ENV = ("RUNFILES_DIR", "RUNFILES_MANIFEST_FILE", "PYTHONPATH", "PYTHONHOME")
+
+
+def _foryc_env():
+    env = dict(os.environ)
+    for key in _LEAKY_ENV:
+        env.pop(key, None)
+    return env
+
+
 def _run_foryc(command):
     if os.name == "nt" and command[0].lower().endswith(".bat"):
         completed = subprocess.run(
@@ -202,9 +216,15 @@ def _run_foryc(command):
             shell=True,
             capture_output=True,
             text=True,
+            env=_foryc_env(),
         )
     else:
-        completed = subprocess.run(command, capture_output=True, text=True)
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=_foryc_env(),
+        )
 
     if completed.returncode != 0:
         output = (completed.stdout or "") + (completed.stderr or "")

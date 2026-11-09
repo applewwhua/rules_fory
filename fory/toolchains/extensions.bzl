@@ -1,16 +1,19 @@
-"""Module extension that provides the `foryc` compiler.
+"""Module extension that provides a locally installed `foryc` compiler.
 
-`foryc` is shipped by the `fory-compiler` Python wheel.  The extension locates
-it (in this order):
+The default toolchain of rules_fory does **not** use this extension: it runs
+the `foryc` of the pinned `fory-compiler` wheel
+(`//fory/toolchains:foryc_pip_toolchain`).  This extension is the escape hatch
+for hosts that already have a compiler installed; it locates `foryc` (in this
+order):
 
 1. `foryc.configure(foryc = "/path/to/foryc")`
 2. the `FORYC` environment variable (`--repo_env=FORYC=...`)
 3. the first `foryc` found on `$PATH`
 
-The repository it creates is not hermetic: it is a thin launcher around the
-locally installed compiler, which keeps rules_fory usable without mirroring
-the Python wheel.  Use a custom `foryc_toolchain` if you need a fully hermetic
-setup.
+and exposes it as `@foryc`.  Select the matching toolchain explicitly with
+`--extra_toolchains=//fory/toolchains:local_foryc_toolchain` (or register it
+in `MODULE.bazel`).  The repository it creates is not hermetic: it is a thin
+launcher around the local installation.
 """
 
 _FORYC_SH = """#!/bin/sh

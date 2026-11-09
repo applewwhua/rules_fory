@@ -1,6 +1,7 @@
 """Language specific code generation for `cc_fory_library` / `py_fory_library`."""
 
 load("//fory:providers.bzl", "ForyCcInfo", "ForyInfo", "ForyPyInfo")
+load("//fory/toolchains:foryc_toolchain.bzl", "foryc_tool_inputs")
 load(
     "//fory/private:common.bzl",
     "FORYC_TOOL",
@@ -67,8 +68,7 @@ def _fory_codegen_impl(ctx):
         outputs = outputs,
         tools = [
             ctx.attr._foryc_tool[DefaultInfo].files_to_run,
-            toolchain.foryc,
-        ],
+        ] + foryc_tool_inputs(toolchain),
         mnemonic = "ForyCodegen",
         progress_message = "Generating Fory %s bindings for %s" % (lang, ctx.label),
     )
