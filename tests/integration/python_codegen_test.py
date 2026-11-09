@@ -13,8 +13,8 @@ import unittest
 
 _MODULE_DIR_SUFFIX = "_fory_py/_person_py_fory_gen"
 _MODULES = (
-    "examples_fdl_address.py",
-    "examples_fdl_person.py",
+    "examples_address.py",
+    "examples_person.py",
 )
 
 
@@ -41,9 +41,9 @@ class PythonCodegenTest(unittest.TestCase):
             )
 
     def test_imports_are_rewritten(self):
-        person = self.read("examples_fdl_person.py")
-        self.assertIn("import examples_fdl_address", person)
-        self.assertNotIn("\nimport examples_fdl\n", person)
+        person = self.read("examples_person.py")
+        self.assertIn("import examples_address", person)
+        self.assertNotIn("\nimport examples\n", person)
 
     def test_generated_modules_are_valid_python(self):
         directory = self.module_dir()

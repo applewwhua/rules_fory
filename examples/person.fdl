@@ -1,11 +1,11 @@
 // Demonstrates a schema that imports another schema of the workspace.
-package examples.fdl.person;
+package examples.person;
 
-import "examples/fdl/address.fdl";
+import "examples/address.fdl";
 
 message Person {
   string name = 1;
   int32 age = 2;
   repeated string emails = 3;
-  examples.fdl.Address address = 4;
+  examples.Address address = 4;
 }

@@ -15,7 +15,7 @@ def cc_fory_library(
     header can be included by its module name, e.g.
 
     ```
-    #include "examples_fdl_person.h"
+    #include "examples_person.h"
     ```
 
     Args:

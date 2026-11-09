@@ -11,8 +11,8 @@ def py_fory_library(
     """Generates Python bindings for a set of `fory_library` targets.
 
     The generated modules are plain importable Python modules named after the
-    path of the `.fdl` file, e.g. `//examples/fdl:person` generates
-    `examples_fdl_person.py`.  The directory holding the modules is
+    path of the `.fdl` file, e.g. `//examples:person` generates
+    `examples_person.py`.  The directory holding the modules is
     added to `sys.path` through the `imports` attribute of the resulting
     `py_library`.
 

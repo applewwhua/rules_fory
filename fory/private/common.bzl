@@ -46,8 +46,8 @@ def module_name(file):
     """Returns the generated module name for a `.fdl` file.
 
     Examples:
-      `examples/fdl/address.fdl` -> `examples_fdl_address`
-      `../fory_schemas/common.fdl`       -> `fory_schemas_common`
+      `examples/address.fdl`       -> `examples_address`
+      `../fory_schemas/common.fdl` -> `fory_schemas_common`
     """
     path = file.short_path
     if path.startswith("../"):

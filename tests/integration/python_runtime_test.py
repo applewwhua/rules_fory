@@ -2,8 +2,8 @@
 
 import unittest
 
-from examples_fdl_address import Address
-from examples_fdl_person import Person
+from examples_address import Address
+from examples_person import Person
 
 
 class PythonRuntimeTest(unittest.TestCase):

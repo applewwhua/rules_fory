@@ -9,7 +9,7 @@ import unittest
 
 from python.runfiles import runfiles
 
-_HEADER_DIR = "examples/fdl/_fory_cc/_person_cc_fory_gen"
+_HEADER_DIR = "examples/_fory_cc/_person_cc_fory_gen"
 
 
 class CcCodegenTest(unittest.TestCase):
@@ -26,23 +26,23 @@ class CcCodegenTest(unittest.TestCase):
             return handle.read()
 
     def test_headers_are_generated(self):
-        address = self.read_header("examples_fdl_address.h")
-        person = self.read_header("examples_fdl_person.h")
+        address = self.read_header("examples_address.h")
+        person = self.read_header("examples_person.h")
         self.assertIn("class Address", address)
         self.assertIn("class Person", person)
 
     def test_includes_are_rewritten(self):
-        person = self.read_header("examples_fdl_person.h")
-        self.assertIn('#include "examples_fdl_address.h"', person)
-        self.assertNotIn('#include "examples_fdl.h"', person)
+        person = self.read_header("examples_person.h")
+        self.assertIn('#include "examples_address.h"', person)
+        self.assertNotIn('#include "examples.h"', person)
 
     def test_runtime_include_is_kept(self):
-        person = self.read_header("examples_fdl_person.h")
+        person = self.read_header("examples_person.h")
         self.assertIn('#include "fory/serialization/fory.h"', person)
 
     def test_namespaces_are_untouched(self):
-        person = self.read_header("examples_fdl_person.h")
-        self.assertIn("namespace examples::fdl::person", person)
+        person = self.read_header("examples_person.h")
+        self.assertIn("namespace examples::person", person)
 
 
 if __name__ == "__main__":

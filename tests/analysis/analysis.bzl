@@ -17,7 +17,7 @@ def _fory_info_test_impl(ctx):
     modules = sorted([module_name(source) for source in info.transitive_sources.to_list()])
     asserts.equals(
         env,
-        ["examples_fdl_address", "examples_fdl_person"],
+        ["examples_address", "examples_person"],
         modules,
         "module names",
     )
@@ -26,8 +26,8 @@ def _fory_info_test_impl(ctx):
     asserts.equals(
         env,
         [
-            "examples/fdl/address.fdl",
-            "examples/fdl/person.fdl",
+            "examples/address.fdl",
+            "examples/person.fdl",
         ],
         import_paths,
         "schema paths",
@@ -55,7 +55,7 @@ def _cc_info_test_impl(ctx):
     includes = cc_info.compilation_context.includes.to_list()
     asserts.true(
         env,
-        any(["examples/fdl/_fory_cc/_person_cc_fory_gen" in include for include in includes]),
+        any(["examples/_fory_cc/_person_cc_fory_gen" in include for include in includes]),
         "generated include directory is missing, got %s" % includes,
     )
 
@@ -65,11 +65,11 @@ def _cc_info_test_impl(ctx):
     headers = sorted([
         header.basename
         for header in cc_info.compilation_context.headers.to_list()
-        if header.basename.startswith("examples_fdl_")
+        if header.basename.startswith("examples_")
     ])
     asserts.equals(
         env,
-        ["examples_fdl_address.h", "examples_fdl_person.h"],
+        ["examples_address.h", "examples_person.h"],
         headers,
         "generated headers",
     )
@@ -93,11 +93,11 @@ def _py_info_test_impl(ctx):
     sources = sorted([
         source.basename
         for source in py_info.transitive_sources.to_list()
-        if source.basename.startswith("examples_fdl_")
+        if source.basename.startswith("examples_")
     ])
     asserts.equals(
         env,
-        ["examples_fdl_address.py", "examples_fdl_person.py"],
+        ["examples_address.py", "examples_person.py"],
         sources,
         "generated modules",
     )

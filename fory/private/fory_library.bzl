@@ -98,7 +98,7 @@ direct counterpart of `proto_library`.
 
 Import statements inside `.fdl` files are resolved relative to the importing
 file first and relative to the workspace root afterwards, so
-`import "examples/fdl/address.fdl";` works from any package.
+`import "examples/address.fdl";` works from any package.
 """,
     attrs = {
         "srcs": attr.label_list(

@@ -1,10 +1,10 @@
 """Serializes and deserializes the schemas of this package with Apache Fory.
 
-    bazel run //examples/fdl:main_py
+    bazel run //examples:main_py
 """
 
-from examples_fdl_address import Address
-from examples_fdl_person import Person
+from examples_address import Address
+from examples_person import Person
 
 
 def make_address() -> Address:

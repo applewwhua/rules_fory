@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "examples_fdl_address.h"
-#include "examples_fdl_person.h"
+#include "examples_address.h"
+#include "examples_person.h"
 
 namespace {
 
@@ -18,11 +18,11 @@ int Fail(const std::string &message) {
 }  // namespace
 
 int main() {
-  examples::fdl::Address address;
+  examples::Address address;
   address.set_street("No.1 Fory Road");
   address.set_city("Hangzhou");
 
-  examples::fdl::person::Person person;
+  examples::person::Person person;
   person.set_name("Alice");
   person.set_age(30);
   person.mutable_emails()->push_back("alice@example.com");
@@ -36,12 +36,12 @@ int main() {
     return Fail("serialize produced an empty payload");
   }
 
-  auto decoded = examples::fdl::person::Person::from_bytes(encoded.value());
+  auto decoded = examples::person::Person::from_bytes(encoded.value());
   if (!decoded.ok()) {
     return Fail("deserialize failed: " + decoded.error().message());
   }
 
-  const examples::fdl::person::Person &restored = decoded.value();
+  const examples::person::Person &restored = decoded.value();
   if (!(restored == person)) {
     return Fail("round trip mismatch");
   }

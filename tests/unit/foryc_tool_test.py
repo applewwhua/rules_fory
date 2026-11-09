@@ -62,10 +62,10 @@ class ParsePackageTest(unittest.TestCase):
 
 class RewriteTest(unittest.TestCase):
     def test_python_import(self):
-        mapping = {"examples_fdl": "examples_fdl_address"}
+        mapping = {"examples": "examples_address"}
         self.assertEqual(
-            foryc_tool.rewrite_python("import examples_fdl\n", mapping),
-            "import examples_fdl_address\n",
+            foryc_tool.rewrite_python("import examples\n", mapping),
+            "import examples_address\n",
         )
 
     def test_python_from_import(self):
@@ -129,10 +129,10 @@ class RewriteTest(unittest.TestCase):
             self.assertEqual(annotations, {"demo_sub.demo.sub.": "demo_sub."})
 
     def test_cpp_include(self):
-        mapping = {"examples_fdl": "examples_fdl_address"}
+        mapping = {"examples": "examples_address"}
         self.assertEqual(
-            foryc_tool.rewrite_cpp('#include "examples_fdl.h"\n', mapping),
-            '#include "examples_fdl_address.h"\n',
+            foryc_tool.rewrite_cpp('#include "examples.h"\n', mapping),
+            '#include "examples_address.h"\n',
         )
 
 

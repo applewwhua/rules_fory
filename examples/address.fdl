@@ -1,5 +1,5 @@
 // A schema that may be imported by other schemas.
-package examples.fdl;
+package examples;
 
 message Address {
   string street = 1;

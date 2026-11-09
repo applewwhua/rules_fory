@@ -32,7 +32,7 @@ rules_fory/
 ├── third_party/
 │   ├── fory/                     # vendored Fory 1.7.7 C++ runtime (cc_library)
 │   └── pyfory/                   # vendored pyfory 1.7.7 runtime (py_library)
-├── examples/fdl/                 # schemas + C++/Python round trip programs
+├── examples/                     # schemas + C++/Python round trip programs
 └── tests/                        # unit / analysis / integration tests
 ```
 
@@ -67,20 +67,20 @@ py_fory_library(
 ```
 
 Generated C++ bindings are header only and include each other by module name
-(`#include "examples_fdl_address.h"`); the directory with the headers is
+(`#include "examples_address.h"`); the directory with the headers is
 published through the include path of the resulting `cc_library`.  Generated
-Python modules are importable by module name (`import examples_fdl_person`)
+Python modules are importable by module name (`import examples_person`)
 because the module directory is added to `sys.path` via the `imports`
 attribute of the resulting `py_library`.
 
 ## Example: serialization round trip
 
-`examples/fdl` contains the schemas `address.fdl` / `person.fdl` plus two
+`examples` contains the schemas `address.fdl` / `person.fdl` plus two
 programs that instantiate, serialize and deserialize them:
 
 ```sh
-bazel run //examples/fdl:main_cc   # C++ + vendored Fory runtime
-bazel run //examples/fdl:main_py   # Python + vendored pyfory runtime
+bazel run //examples:main_cc   # C++ + vendored Fory runtime
+bazel run //examples:main_py   # Python + vendored pyfory runtime
 ```
 
 ```
@@ -93,14 +93,14 @@ round trip ok
 The generated bindings expose the Fory API directly:
 
 ```cpp
-examples::fdl::person::Person person;
+examples::person::Person person;
 person.set_name("Alice");
 auto bytes = person.to_bytes();                                   // Result<vector<uint8_t>, Error>
-auto restored = examples::fdl::person::Person::from_bytes(*bytes); // Result<Person, Error>
+auto restored = examples::person::Person::from_bytes(*bytes); // Result<Person, Error>
 ```
 
 ```python
-from examples_fdl_person import Person
+from examples_person import Person
 
 person = Person(name="Alice", age=30)
 data = person.to_bytes()
@@ -115,16 +115,16 @@ module name from the **path** of the schema and rewrites the references that
 `foryc` emitted (`import` statements, `#include` directives and qualified type
 annotations):
 
-| schema path                       | FDL package             | module name                     |
-| --------------------------------- | ----------------------- | ------------------------------- |
-| `examples/fdl/person.fdl`         | `examples.fdl.person`   | `examples_fdl_person`           |
+| schema path           | FDL package       | module name       |
+| --------------------- | ----------------- | ----------------- |
+| `examples/person.fdl` | `examples.person` | `examples_person` |
 
 Consequences:
 
 * every `.fdl` file must declare a unique `package` (same restriction as the
   `foryc` CLI, which generates one module per package);
 * import statements are resolved relative to the importing file first and to
-  the workspace root afterwards, so `import "examples/fdl/address.fdl";` works
+  the workspace root afterwards, so `import "examples/address.fdl";` works
   from any package.
 
 ## The `foryc` compiler

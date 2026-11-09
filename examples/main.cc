@@ -1,6 +1,6 @@
 // Serializes and deserializes the schemas of this package with Apache Fory.
 //
-//   bazel run //examples/fdl:main_cc
+//   bazel run //examples:main_cc
 
 #include <cstdint>
 #include <iomanip>
@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "examples_fdl_address.h"
-#include "examples_fdl_person.h"
+#include "examples_address.h"
+#include "examples_person.h"
 
 namespace {
 
@@ -23,15 +23,15 @@ std::string ToHex(const std::vector<std::uint8_t> &data) {
   return out.str();
 }
 
-examples::fdl::Address MakeAddress() {
-  examples::fdl::Address address;
+examples::Address MakeAddress() {
+  examples::Address address;
   address.set_street("No.1 Fory Road");
   address.set_city("Hangzhou");
   return address;
 }
 
-examples::fdl::person::Person MakePerson() {
-  examples::fdl::person::Person person;
+examples::person::Person MakePerson() {
+  examples::person::Person person;
   person.set_name("Alice");
   person.set_age(30);
   person.mutable_emails()->push_back("alice@example.com");
@@ -43,7 +43,7 @@ examples::fdl::person::Person MakePerson() {
 }  // namespace
 
 int main() {
-  const examples::fdl::person::Person person = MakePerson();
+  const examples::person::Person person = MakePerson();
   std::cout << "person: name=" << person.name() << ", age=" << person.age()
             << ", address=" << person.address().street() << " / "
             << person.address().city() << "\n";
@@ -56,12 +56,12 @@ int main() {
   std::cout << "serialized " << encoded.value().size() << " bytes: "
             << ToHex(encoded.value()) << "\n";
 
-  auto decoded = examples::fdl::person::Person::from_bytes(encoded.value());
+  auto decoded = examples::person::Person::from_bytes(encoded.value());
   if (!decoded.ok()) {
     std::cerr << "deserialize failed: " << decoded.error().message() << "\n";
     return 1;
   }
-  const examples::fdl::person::Person &restored = decoded.value();
+  const examples::person::Person &restored = decoded.value();
   std::cout << "deserialized: name=" << restored.name()
             << ", age=" << restored.age() << ", emails=" << restored.emails().size()
             << ", city=" << restored.address().city() << "\n";
