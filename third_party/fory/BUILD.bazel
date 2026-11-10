@@ -18,8 +18,8 @@ cc_library(
     copts = select({
         # `fory/util/macros.h` enables AVX2 intrinsics unconditionally on
         # x86_64, so the translation units must be compiled with AVX2 enabled.
-        "@platforms//cpu:x86_64": ["-mavx2"],
-        "//conditions:default": [],
+        "@platforms//cpu:x86_64": ["-mavx2", "-Wno-sign-compare"],
+        "//conditions:default": ["-Wno-sign-compare"],
     }),
     strip_include_prefix = "/third_party/fory/cpp",
     alwayslink = True,
