@@ -1,0 +1,14 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Action driver of the Fory FDL rules. It imports the generators of the
+# fory-compiler wheel (hub repository "fory_pip", see MODULE.bazel) instead of
+# calling a locally installed foryc binary, so code generation runs on the
+# hermetic Bazel Python toolchain like every other action.
+py_binary(
+    name = "foryc_tool",
+    srcs = ["foryc_tool.py"],
+    main = "foryc_tool.py",
+    deps = ["@fory_pip//fory_compiler"],
+)

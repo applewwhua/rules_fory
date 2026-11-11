@@ -1,0 +1,5 @@
+package example.shared;
+
+message SharedRequest [id=1001] {
+  string name = 1;
+}

@@ -22,20 +22,52 @@ bazel_dep(name = "rules_python", version = "1.7.0")
 # Only needed to run the rules' own test suite.
 bazel_dep(name = "bazel_skylib", version = "1.8.2", dev_dependency = True)
 
-# Default toolchain: the `foryc` CLI of the pinned `fory-compiler` wheel,
-# fetched from PyPI (see //fory/toolchains:requirements_lock.txt).
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+# ---------------------------------------------------------------------------
+# Python packages for the FDL rules, resolved through rules_python's pip
+# extension (hub repository "fory_pip") against the pinned 3.11 Python
+# toolchain.
+#
+#   fory-compiler  the FDL compiler. The code-generation actions run a
+#                  py_binary (//tools:foryc_tool) that imports foryc from this
+#                  wheel - the same code as the foryc console script - instead
+#                  of using a locally installed foryc binary.
+#   pyfory         the Python runtime that fdl-generated code imports.
+#
+# The wheels declare no further dependencies, so the lock file is the complete
+# closure. pyfory ships per-architecture binary wheels; the linux
+# configurations (amd64/aarch64) are pinned.
+# ---------------------------------------------------------------------------
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
     hub_name = "fory_pip",
     python_version = "3.11",
-    requirements_lock = "//fory/toolchains:requirements_lock.txt",
+    requirements_lock = "//private:requirements_lock.txt",
 )
 use_repo(pip, "fory_pip")
 
-# Fallback toolchain: a compiler that is already installed on the host, located
-# through `foryc.configure(foryc = ...)`, `--repo_env=FORYC=/path/to/foryc`, or
-# `$PATH`.
-foryc = use_extension("//fory/toolchains:extensions.bzl", "foryc")
-use_repo(foryc, "foryc")
-
-register_toolchains("//fory/toolchains:foryc_pip_toolchain")
+# ---------------------------------------------------------------------------
+# Fory C++ runtime: the serialization library for the Fory IDL-generated C++
+# code. The Apache Fory release ships Bazel BUILD files for cpp/ itself, so no
+# BUILD overlay of our own is needed - the upstream target
+# @fory//cpp/fory/serialization:fory_serialization is used as it is. Its
+# strip_include_prefix = "/cpp" exposes the headers under fory/<module>/...,
+# which is exactly what generated code includes.
+#
+# The release addresses its packages relative to the whole Fory repository
+# (//cpp/fory/...), so the archive is consumed as released (no strip_prefix)
+# and the C++ targets keep their cpp/ path segment.
+#
+# Bazel 9 no longer defines the native cc_* rules, and the upstream BUILD files
+# load only the ones they need for CMake-independent use; loading the whole set
+# covers the cc_binary()/cc_test() targets they declare as well. Those test
+# targets reference @googletest, which this workspace does not declare - only
+# the upstream serialization libraries are built here.
+# ---------------------------------------------------------------------------
+http_archive(
+    name = "fory",
+    sha256 = "8317ab70766f7a43e5fd07468af414237d5bbc11d4fed1022dd9d00b009a876d",
+    strip_prefix = "fory-1.7.7",
+    urls = ["https://github.com/apache/fory/archive/refs/tags/v1.7.7.tar.gz"],
+)

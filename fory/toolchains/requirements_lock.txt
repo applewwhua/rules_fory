@@ -1,7 +1,0 @@
-# Python dependencies of the rules_fory toolchain.
-#
-# `foryc` is the compiler CLI shipped by the `fory-compiler` wheel; pinning it
-# here makes the default toolchain hermetic instead of relying on a compiler
-# that happens to be installed on the host.
-fory-compiler==1.7.7 \
-    --hash=sha256:8697e6a71095f42cce349082eba87e0be5767ad1b5b0279157ea91da5f01e9be

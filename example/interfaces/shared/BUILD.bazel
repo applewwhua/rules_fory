@@ -1,0 +1,26 @@
+load(
+    "//:defs.bzl",
+    "cc_fory_library",
+    "fory_library",
+    "py_fory_library",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+# Language independent schema target, the counterpart of proto_library.
+fory_library(
+    name = "shared",
+    srcs = ["shared.fdl"],
+)
+
+# C++ and Python bindings. The runtime attributes are omitted on purpose: they
+# default to the runtimes of MODULE.bazel (@fory and @fory_pip//pyfory).
+cc_fory_library(
+    name = "shared_cc",
+    deps = [":shared"],
+)
+
+py_fory_library(
+    name = "shared_py",
+    deps = [":shared"],
+)

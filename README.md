@@ -17,23 +17,19 @@ Supported Bazel version: **9.2** (bzlmod only, no `WORKSPACE`).
 
 ```
 rules_fory/
-├── MODULE.bazel                  # module definition + toolchain registration
-├── fory/
-│   ├── defs.bzl                  # public API (load from here)
-│   ├── providers.bzl             # ForyInfo / ForyCcInfo / ForyPyInfo
-│   ├── private/                  # rule implementations
-│   │   ├── common.bzl                # naming + path helpers
-│   │   ├── fory_library.bzl          # fory_library
-│   │   ├── fory_codegen.bzl          # language codegen rule
-│   │   ├── fory_cc_library.bzl       # cc_fory_library macro
-│   │   └── fory_py_library.bzl       # py_fory_library macro
-│   ├── toolchains/               # foryc toolchain + module extension
-│   └── tools/                    # foryc wrapper (deterministic outputs)
-├── third_party/
-│   ├── fory/                     # vendored Fory 1.7.7 C++ runtime (cc_library)
-│   └── pyfory/                   # vendored pyfory 1.7.7 runtime (py_library)
-├── examples/                     # schemas + C++/Python round trip programs
-└── tests/                        # unit / analysis / integration tests
+├── MODULE.bazel              # module definition + dependencies (pip hub, @fory runtime)
+├── defs.bzl                  # public API (load from here)
+├── providers.bzl             # ForyInfo
+├── private/                  # rule implementations
+│   ├── common.bzl            # naming + path helpers, shared codegen action
+│   ├── fory_library.bzl      # fory_library
+│   ├── fory_cc_aspect.bzl    # per-schema C++ code generation (applied once)
+│   ├── fory_py_aspect.bzl    # per-schema Python code generation (applied once)
+│   ├── fory_cc_library.bzl   # cc_fory_library macro
+│   ├── fory_py_library.bzl   # py_fory_library macro
+│   └── requirements_lock.txt # pinned fory-compiler / pyfory wheels
+├── tools/                    # foryc action driver (imports the wheel's compiler)
+└── example/                  # schemas + C++/Python round trip tests
 ```
 
 ## Usage
@@ -45,175 +41,121 @@ bazel_dep(name = "rules_fory", version = "0.1.0")
 
 ```python
 # BUILD.bazel
-load("@rules_fory//fory:defs.bzl", "fory_library", "cc_fory_library", "py_fory_library")
+load("@rules_fory//:defs.bzl", "fory_library", "cc_fory_library", "py_fory_library")
 
 fory_library(
-    name = "person",
-    srcs = ["person.fdl"],
-    deps = [":address"],
+    name = "greeter",
+    srcs = ["greeter.fdl"],
+    import_roots = ["interfaces"],        # imports are written relative to this tree
+    deps = ["//interfaces:shared"],
 )
 
 cc_fory_library(
-    name = "person_cc",
-    deps = [":person"],
-    runtime = "//third_party/fory:fory",   # or "@fory//:fory" from a fory module
+    name = "greeter_cc",
+    deps = [":greeter"],                  # the closure of deps is generated with it
 )
 
 py_fory_library(
-    name = "person_py",
-    deps = [":person"],
-    runtime = "//third_party/pyfory:pyfory",
+    name = "greeter_py",
+    deps = [":greeter"],
 )
 ```
 
-Generated C++ bindings are header only and include each other by module name
-(`#include "examples_address.h"`); the directory with the headers is
-published through the include path of the resulting `cc_library`.  Generated
-Python modules are importable by module name (`import examples_person`)
-because the module directory is added to `sys.path` via the `imports`
-attribute of the resulting `py_library`.
+Like `cc_proto_library` / `py_proto_library`, the bindings of every schema are
+generated **exactly once** (through an aspect applied to each `fory_library`
+of the dependency closure), no matter how many `cc_fory_library` /
+`py_fory_library` targets depend on it.
 
-## Example: serialization round trip
+Generated C++ bindings are header only; headers mirror the `.fdl` path and are
+included the way protobuf headers are
+(`#include "interfaces/greeter/greeter.fory.h"`). Generated Python modules are
+imported by their dotted path (`from interfaces.greeter import greeter_fory`),
+like protobuf's `*_pb2` modules.
 
-`examples` contains the schemas `address.fdl` / `person.fdl` plus two
-programs that instantiate, serialize and deserialize them:
+## Example
+
+`example/` contains two schema packages (`shared`, `greeter` - `greeter`
+imports `shared` through an `import_roots` search root) plus round trip tests
+in both languages:
 
 ```sh
-bazel run //examples:main_cc   # C++ + vendored Fory runtime
-bazel run //examples:main_py   # Python + vendored pyfory runtime
-```
-
-```
-person: name=Alice, age=30, address=No.1 Fory Road / Hangzhou
-serialized 115 bytes: 01001c000f80ae7fe8...
-deserialized: name=Alice, age=30, emails=2, city=Hangzhou
-round trip ok
+bazel test //example/...
 ```
 
 The generated bindings expose the Fory API directly:
 
 ```cpp
-examples::person::Person person;
-person.set_name("Alice");
-auto bytes = person.to_bytes();                                   // Result<vector<uint8_t>, Error>
-auto restored = examples::person::Person::from_bytes(*bytes); // Result<Person, Error>
+#include "example/interfaces/greeter/greeter.fory.h"
+
+interfaces::greeter::Greeting greeting;
+greeting.set_text("hello");
+auto bytes = greeting.to_bytes();            // Result<vector<uint8_t>, Error>
 ```
 
 ```python
-from examples_person import Person
+from example.interfaces.greeter import greeter_fory
 
-person = Person(name="Alice", age=30)
-data = person.to_bytes()
-restored = Person.from_bytes(data)
+greeting = greeter_fory.Greeting(text="hello")
+decoded = greeter_fory.Greeting.from_bytes(greeting.to_bytes())
 ```
 
 ## Module naming
 
 `foryc` derives the generated file name from the `package` statement, which
 Bazel cannot know during the analysis phase.  rules_fory therefore derives the
-module name from the **path** of the schema and rewrites the references that
-`foryc` emitted (`import` statements, `#include` directives and qualified type
-annotations):
+module name from the **path** of the schema (mirroring protoc) and rewrites
+the references that `foryc` emitted (`import` statements, `#include`
+directives and qualified type annotations):
 
-| schema path           | FDL package       | module name       |
-| --------------------- | ----------------- | ----------------- |
-| `examples/person.fdl` | `examples.person` | `examples_person` |
+| schema path                   | C++ header                     | Python module           |
+| ----------------------------- | ------------------------------ | ----------------------- |
+| `interfaces/greeter/greeter.fdl` | `interfaces/greeter/greeter.fory.h` | `interfaces.greeter.greeter_fory` |
 
 Consequences:
 
 * every `.fdl` file must declare a unique `package` (same restriction as the
   `foryc` CLI, which generates one module per package);
 * import statements are resolved relative to the importing file first and to
-  the workspace root afterwards, so `import "examples/address.fdl";` works
-  from any package.
+  the workspace root afterwards; `import_roots` declares additional search
+  roots so the `.fdl` sources stay independent of where they live in the
+  workspace.
 
 ## The `foryc` compiler
 
-Code generation runs `foryc`, the CLI of the
-[`fory-compiler`](https://pypi.org/project/fory-compiler/) wheel.  By default
-rules_fory **downloads the pinned wheel** from PyPI and runs its `foryc` entry
-point through a `py_binary` launcher, so nothing has to be installed on the
-host:
+Code generation imports the `foryc` implementation of the
+[`fory-compiler`](https://pypi.org/project/fory-compiler/) wheel.  The wheel is
+fetched from PyPI through rules_python's pip extension (pinned in
+`private/requirements_lock.txt`, currently `fory-compiler==1.7.7`) and runs
+in-process on the hermetic Bazel Python toolchain like every other action -
+nothing has to be installed on the host.  The first build needs network access
+to PyPI (and GitHub, for the `@fory` C++ runtime archive).
 
-* `//fory/toolchains:foryc_pip_toolchain` – default toolchain, backed by
-  `@fory_pip//fory_compiler` (pinned in
-  `fory/toolchains/requirements_lock.txt`, currently `fory-compiler==1.7.7`).
+## Runtimes
 
-### Using a locally installed compiler
-
-An existing `foryc` installation can be used instead.  The module extension in
-`fory/toolchains/extensions.bzl` locates it in this order:
-
-1. `foryc.configure(foryc = "/path/to/foryc")` in `MODULE.bazel`
-2. `$FORYC` (`bazel build --repo_env=FORYC=/path/to/foryc`)
-3. `which foryc`
-
-and `//fory/toolchains:local_foryc_toolchain` exposes it as a drop-in
-replacement, e.g. for offline builds:
-
-```sh
-bazel build --extra_toolchains=//fory/toolchains:local_foryc_toolchain //...
-```
-
-A custom compiler can also be pinned by declaring a toolchain of your own:
-
-```python
-load("@rules_fory//fory/toolchains:foryc_toolchain.bzl", "foryc_toolchain")
-
-foryc_toolchain(
-    name = "my_foryc_impl",
-    foryc = "@foryc//:foryc.sh",
-)
-
-toolchain(
-    name = "my_foryc",
-    toolchain = ":my_foryc_impl",
-    toolchain_type = "@rules_fory//fory/toolchains:foryc_toolchain_type",
-)
-```
-
-Module consumers register the default (`foryc_pip_toolchain`) or the local one
-in their own `MODULE.bazel`:
-
-```python
-register_toolchains("@rules_fory//fory/toolchains:foryc_pip_toolchain")
-```
-
-## Vendored runtimes
-
-`third_party/fory` contains the C++ runtime of Apache Fory 1.7.7
-(`cpp/fory` of the upstream repository) and `third_party/pyfory` the
-`pyfory` 1.7.7 wheel of CPython 3.11.  Both are exposed as plain Bazel
-libraries so the examples and tests run without any system installation:
-
-* `//third_party/fory:fory` – `cc_library` publishing `fory/...` headers
-  (upstream `strip_include_prefix = "/cpp"`).
-* `//third_party/pyfory:pyfory` – `py_library` publishing the `pyfory`
-  package (requires the CPython 3.11 toolchain, which rules_python pins as
-  default).
-
-To upgrade, replace the trees with the sources of the new release; no BUILD
-changes are required as long as the include layout is unchanged.
+* C++: `@fory//cpp/fory/serialization:fory_serialization`, the upstream
+  Apache Fory release archive (fetched by `MODULE.bazel`, which keeps the
+  upstream BUILD files - `strip_include_prefix = "/cpp"` publishes the headers
+  under `fory/...`, exactly what generated code includes).  Override with the
+  `runtime` attribute of `cc_fory_library`.
+* Python: `@fory_pip//pyfory` from the same pip hub as the compiler.  Override
+  with the `runtime` attribute of `py_fory_library`.
 
 ## Testing
 
 ```sh
-bazel test //tests/...       # unit + analysis + integration tests
-bazel build //examples/...   # generate C++/Python bindings
+bazel test //...    # C++ and Python serialization round trips
 ```
 
-The suite covers the wrapper tool (module naming and rewriting), the providers
-and the generated code, including runtime round trips in both languages:
-
-* `tests/unit` – `foryc_tool.py` unit tests;
-* `tests/analysis` – analysis-time checks of `ForyInfo`, `CcInfo`, `PyInfo`;
-* `tests/integration` – codegen output, C++/Python runtime round trips.
+The example covers a cross-package import (`greeter` imports `shared`) and
+verifies the generated bindings end to end in both languages.
 
 ## Limitations / roadmap
 
 * Code generation supports the `python` and `cpp` generators of `foryc`
   (`.py` modules and header-only `.h` files); other languages of `foryc` are
   not wired up yet.
-* FDL schemas in external repositories are supported for C++; Python import
-  paths currently assume schemas of the main workspace.
-* Bazel 8.x is not verified yet; the rules target Bazel 9.2.
+* Python import paths currently assume schemas of the main workspace.
+* The generated Python modules rely on PEP 420 namespace packages; the
+  `--incompatible_default_to_explicit_init_py` flag in `.bazelrc` must be
+  enabled (Bazel's auto-generated `__init__.py` files would shadow the
+  mirrored packages of the generated-code directories).

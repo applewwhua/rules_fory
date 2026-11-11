@@ -1,0 +1,31 @@
+load(
+    "//:defs.bzl",
+    "cc_fory_library",
+    "fory_library",
+    "py_fory_library",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+# Imports shared.fdl from //example/interfaces/shared. The
+# import inside greeter.fdl is written relative to the interfaces tree
+# (`import "shared/shared.fdl";`), which foryc resolves through the
+# `import_roots` search root declared below.
+fory_library(
+    name = "greeter",
+    srcs = ["greeter.fdl"],
+    import_roots = ["example/interfaces"],
+    deps = ["//example/interfaces/shared"],
+)
+
+# The bindings generate the complete closure of `deps`, so `:greeter` is the
+# only schema dependency needed here - the shared schemas come with it.
+cc_fory_library(
+    name = "greeter_cc",
+    deps = [":greeter"],
+)
+
+py_fory_library(
+    name = "greeter_py",
+    deps = [":greeter"],
+)

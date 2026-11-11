@@ -1,0 +1,8 @@
+package example.greeter;
+
+import "shared/shared.fdl";
+
+message Greeting [id=1002] {
+  string text = 1;
+  SharedRequest request = 2;
+}

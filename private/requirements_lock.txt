@@ -1,0 +1,19 @@
+# Python dependencies of the rules_fory rules, resolved through rules_python's
+# pip extension (hub repository "fory_pip", see MODULE.bazel) against the
+# workspace's pinned 3.11 Python toolchain.
+#
+#   fory-compiler  the FDL compiler. The code-generation driver imports foryc
+#                  (the console script this wheel ships) from this wheel
+#                  instead of using a locally installed binary.
+#   pyfory         the Python runtime that fdl-generated code imports.
+#
+# Neither wheel declares further dependencies, so this file is the complete
+# closure. pyfory ships per-architecture binary wheels; both linux
+# configurations (amd64/aarch64) are pinned here.
+
+fory-compiler==1.7.7 \
+    --hash=sha256:8697e6a71095f42cce349082eba87e0be5767ad1b5b0279157ea91da5f01e9be
+
+pyfory==1.7.7 \
+    --hash=sha256:5b4e4df6bc27119f680a42701cb5fabfc1069e58d6ed9868ee4c46011cd2ef78 \
+    --hash=sha256:3f1e2d7888dd55413cb8bffd186853c9dbc09d2e04e65985fe1f3449b8a67358

@@ -1,7 +1,0 @@
-// A schema that may be imported by other schemas.
-package examples;
-
-message Address {
-  string street = 1;
-  string city = 2;
-}

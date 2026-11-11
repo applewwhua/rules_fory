@@ -1,0 +1,20 @@
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:py_test.bzl", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# Round-trip tests for the bindings of the schemas under
+# //example/interfaces.  Only `greeter_cc` / `greeter_py` are
+# needed - the generated bindings of shared.fdl come with them, together with
+# the Fory runtimes.
+cc_test(
+    name = "greeter_fory_cc_test",
+    srcs = ["greeter_fory_cc_test.cc"],
+    deps = ["//example/interfaces/greeter:greeter_cc"],
+)
+
+py_test(
+    name = "greeter_fory_py_test",
+    srcs = ["greeter_fory_py_test.py"],
+    deps = ["//example/interfaces/greeter:greeter_py"],
+)

@@ -188,21 +188,6 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
-    "//fory/toolchains:extensions.bzl%foryc": {
-      "general": {
-        "bzlTransitiveDigest": "LhN7tkv4McfRIB9YwPG4La3ZSXAvu9pGJ4Xx3/ZpB7I=",
-        "usagesDigest": "YO/dfHtPF/+8Rr2/YVPMAKQ3ej2m8xE4UfFnY9wQEss=",
-        "recordedInputs": [],
-        "generatedRepoSpecs": {
-          "foryc": {
-            "repoRuleId": "@@//fory/toolchains:extensions.bzl%_foryc_repository",
-            "attributes": {
-              "foryc_path": ""
-            }
-          }
-        }
-      }
-    },
     "@@rules_kotlin+//src/main/starlark/core/repositories:bzlmod_setup.bzl%rules_kotlin_extensions": {
       "general": {
         "bzlTransitiveDigest": "+Kp6j204mBZ3mxlIDDR0gBoP45BZ4jYRhRAcB8sU0qc=",
