@@ -1,0 +1,36 @@
+---
+# Formatting for the C++ sources of this workspace (//talker, //listener).
+# Based on Google style, with the project's own tweaks: 4 spaces of indent,
+# braces on their own line and a 120 column limit.
+BasedOnStyle: Google
+Language: Cpp
+# 4 spaces per level, never tabs.
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+# public/protected/private are not indented relative to the class body.
+AccessModifierOffset: -4
+# Braces go on a line of their own (Allman). The one exception is a lambda
+# body: its opening brace stays on the line that introduces it. The flags below
+# are Allman's, spelled out because a preset cannot be partially overridden.
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: true
+  AfterClass: true
+  AfterControlStatement: Always
+  AfterEnum: true
+  AfterExternBlock: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: false
+  BeforeWhile: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+# Lines may be up to 120 characters wide.
+ColumnLimit: 120
+...
